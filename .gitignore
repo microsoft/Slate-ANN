@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock is kept for binaries/workspaces (we have a CLI), so DO track Cargo.lock.
+# (No ignore entry for Cargo.lock on purpose.)
+
+# Index artifacts & scratch data produced by the engine at runtime
+*.vectors
+*.graph
+*.pq
+*.offsets
+*.meta.json
+/scratch/
+/data/
+/tmp/
+*.idx
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

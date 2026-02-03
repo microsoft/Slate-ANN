@@ -1,0 +1,21 @@
+[package]
+name = "slate-index"
+description = "Top-level Slate-ANN index: build pipeline, on-disk format, and public query API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+slate-core = { workspace = true }
+slate-simd = { workspace = true }
+slate-storage = { workspace = true }
+slate-pq = { workspace = true }
+slate-graph = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

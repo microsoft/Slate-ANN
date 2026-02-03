@@ -1,0 +1,18 @@
+[package]
+name = "slate-graph"
+description = "Pluggable ANN index backends (HNSW, IVF) with pruning and two-level hybrid search for Slate-ANN"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+slate-core = { workspace = true }
+slate-simd = { workspace = true }
+slate-storage = { workspace = true }
+slate-pq = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

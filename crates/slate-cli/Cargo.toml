@@ -1,0 +1,18 @@
+[package]
+name = "slate-cli"
+description = "Command-line build/query/bench tool for the Slate-ANN vector search engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "slate"
+path = "src/main.rs"
+
+[dependencies]
+slate-core = { workspace = true }
+slate-index = { workspace = true }
+clap = { workspace = true }

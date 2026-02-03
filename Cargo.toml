@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/slate-core",
+    "crates/slate-simd",
+    "crates/slate-storage",
+    "crates/slate-pq",
+    "crates/slate-graph",
+    "crates/slate-index",
+    "crates/slate-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/microsoft/Slate-ANN"
+authors = ["Slate-ANN contributors"]
+
+# Centralized dependency versions. Member crates reference these with
+# `dep = { workspace = true }` so versions stay consistent workspace-wide.
+[workspace.dependencies]
+# Internal crates
+slate-core = { path = "crates/slate-core" }
+slate-simd = { path = "crates/slate-simd" }
+slate-storage = { path = "crates/slate-storage" }
+slate-pq = { path = "crates/slate-pq" }
+slate-graph = { path = "crates/slate-graph" }
+slate-index = { path = "crates/slate-index" }
+
+# External
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"] }
+clap = { version = "4", features = ["derive"] }
+
+# Dev / bench
+proptest = "1"
+criterion = "0.5"
+
+# Release profile tuned for the SIMD-heavy, throughput-oriented workload.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# Benchmarks need unwinding; keep a dedicated profile that doesn't abort.
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

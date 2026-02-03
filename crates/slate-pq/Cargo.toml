@@ -1,0 +1,16 @@
+[package]
+name = "slate-pq"
+description = "Product quantization (training, encoding, ADC tables) for Slate-ANN's approximate RAM tier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+slate-core = { workspace = true }
+slate-simd = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

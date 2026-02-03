@@ -1,0 +1,18 @@
+[package]
+name = "slate-storage"
+description = "Memory-mapped disk-resident vector storage, dtype codecs, and HDD I/O scheduler for Slate-ANN"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+slate-core = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

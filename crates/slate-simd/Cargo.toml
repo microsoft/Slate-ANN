@@ -1,0 +1,23 @@
+[package]
+name = "slate-simd"
+description = "SIMD distance kernels (AVX-512/AVX2/NEON/scalar) with runtime dispatch for Slate-ANN"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+slate-core = { workspace = true }
+half = { workspace = true }
+bytemuck = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[features]
+# Optional nightly path using std::simd (portable_simd). Off by default so the
+# crate builds on stable. Enable with `--features portable_simd` on nightly.
+portable_simd = []
