@@ -17,6 +17,10 @@ bytemuck = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 
+[[bench]]
+name = "distance"
+harness = false
+
 [features]
 # Optional nightly path using std::simd (portable_simd). Off by default so the
 # crate builds on stable. Enable with `--features portable_simd` on nightly.
