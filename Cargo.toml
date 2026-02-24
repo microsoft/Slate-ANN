@@ -41,6 +41,7 @@ clap = { version = "4", features = ["derive"] }
 # Dev / bench
 proptest = "1"
 criterion = "0.5"
+tempfile = "3"
 
 # Release profile tuned for the SIMD-heavy, throughput-oriented workload.
 [profile.release]

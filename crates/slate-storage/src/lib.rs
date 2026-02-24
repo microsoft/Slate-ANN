@@ -7,6 +7,34 @@
 //! Only the graph topology, PQ codes, and the ID→offset map live in RAM;
 //! exact vectors are streamed from this layer on demand.
 //!
-//! Populated in Phase 2 and Phase 7.
+//! ## Layout
+//!
+//! A store file is a self-describing [`format::FileHeader`] followed by
+//! fixed-size blocks of back-to-back vectors ([`layout::BlockLayout`]). A
+//! vector never crosses a block boundary, so any fetch touches exactly one
+//! block — one seek plus one sequential read on a spinning disk.
+//!
+//! ## Reading
+//!
+//! [`reader::VectorStore`] opens a file over an [`io::IoBackend`]:
+//! [`io::MmapBackend`] for zero-copy SSD/warm-cache access, or
+//! [`io::PreadBackend`] for explicit large positioned reads suited to HDDs.
+//! Access-pattern [`mmap::Advice`] hints expose the `madvise` knob.
+//!
+//! Phase 2 implements the f32 path; f16/i8 codecs and the elevator scheduler
+//! arrive in Phase 7.
 
 #![doc(html_root_url = "https://docs.rs/slate-storage")]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+pub mod format;
+pub mod io;
+pub mod layout;
+pub mod mmap;
+pub mod reader;
+
+pub use format::{FileHeader, FORMAT_VERSION, HEADER_SIZE, MAGIC};
+pub use io::{IoBackend, MmapBackend, PreadBackend};
+pub use layout::{BlockLayout, StoreWriter};
+pub use mmap::{Advice, MmapView};
+pub use reader::VectorStore;

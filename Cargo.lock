@@ -814,6 +814,7 @@ dependencies = [
  "memmap2",
  "proptest",
  "slate-core",
+ "tempfile",
 ]
 
 [[package]]
