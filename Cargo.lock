@@ -783,6 +783,7 @@ dependencies = [
  "slate-pq",
  "slate-simd",
  "slate-storage",
+ "tempfile",
 ]
 
 [[package]]
