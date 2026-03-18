@@ -11,6 +11,7 @@
 #![doc(html_root_url = "https://docs.rs/slate-core")]
 
 pub mod config;
+pub mod cost;
 mod dtype;
 mod error;
 mod id;
@@ -20,6 +21,7 @@ pub use config::{
     BuildConfig, HnswParams, IndexBackend, IoProfile, IvfParams, PqParams, SearchConfig,
     StorageParams,
 };
+pub use cost::{DistanceCost, QueryCost, QueryCounters, StorageProfile};
 pub use dtype::Dtype;
 pub use error::{Error, Result};
 pub use id::VectorId;
