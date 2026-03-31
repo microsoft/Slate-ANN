@@ -1,7 +1,51 @@
-//! Bounded top-k collector.
+//! Search result types and the bounded top-k collector shared by every
+//! Slate-ANN backend.
+//!
+//! These live in `slate-core` — the shared-vocabulary crate — so that both the
+//! graph backends (`slate-graph`) and the top-level engine (`slate-index`) can
+//! produce and rank results with one canonical [`Neighbor`] type and one
+//! [`TopK`] collector, without any inter-crate dependency cycle.
 
-use crate::neighbor::{cmp_ascending, Neighbor};
+use crate::VectorId;
 use std::collections::BinaryHeap;
+
+/// A single search result: a vector identity paired with its distance score.
+///
+/// Scores follow the engine-wide **ascending** ranking convention (smaller =
+/// closer), matching [`crate::Metric`]. For `L2` the score is squared
+/// Euclidean distance; for `InnerProduct` it is the negated dot product; for
+/// `Cosine` it is `1 − cos`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Neighbor {
+    /// Identity of the matched vector.
+    pub id: VectorId,
+    /// Distance score (ascending: smaller is closer).
+    pub score: f32,
+}
+
+impl Neighbor {
+    /// Construct a neighbor from an id and score.
+    #[inline]
+    #[must_use]
+    pub const fn new(id: VectorId, score: f32) -> Self {
+        Self { id, score }
+    }
+}
+
+/// Total ordering over `(score, id)` for ranking.
+///
+/// `f32` has no total `Ord` (NaN), so we order by [`f32::total_cmp`] on the
+/// score and break ties by ascending `id`. This makes results **deterministic**
+/// regardless of visitation order. Smaller scores order first (ascending = best
+/// first); NaN scores — which would signal an upstream bug — sort to the end via
+/// `total_cmp` and so are never preferred over real neighbors.
+#[inline]
+#[must_use]
+pub fn cmp_ascending(a: &Neighbor, b: &Neighbor) -> core::cmp::Ordering {
+    a.score
+        .total_cmp(&b.score)
+        .then_with(|| a.id.cmp(&b.id))
+}
 
 /// Wrapper giving [`Neighbor`] a total `Ord` via [`cmp_ascending`].
 ///
@@ -31,7 +75,7 @@ impl Ord for Ranked {
 /// in O(N log k) time and O(k) memory.
 ///
 /// Never materializes all candidate distances — suitable for a brute-force scan
-/// over an arbitrarily large store.
+/// over an arbitrarily large store, or for bounding a graph beam.
 #[derive(Debug)]
 pub struct TopK {
     k: usize,
@@ -70,6 +114,21 @@ impl TopK {
         }
     }
 
+    /// The current worst (largest) retained score, or `None` if empty.
+    ///
+    /// Useful as a beam-search cutoff: once `k` neighbors are held, any
+    /// candidate not better than this can be skipped.
+    #[must_use]
+    pub fn worst_score(&self) -> Option<f32> {
+        self.heap.peek().map(|r| r.0.score)
+    }
+
+    /// Whether the collector is full (holds exactly `k` neighbors).
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.heap.len() >= self.k
+    }
+
     /// Number of neighbors currently retained.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -94,10 +153,34 @@ impl TopK {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slate_core::VectorId;
+    use core::cmp::Ordering;
 
     fn n(id: u64, score: f32) -> Neighbor {
         Neighbor::new(VectorId::new(id), score)
+    }
+
+    #[test]
+    fn orders_by_score_then_id() {
+        let a = Neighbor::new(VectorId::new(5), 1.0);
+        let b = Neighbor::new(VectorId::new(2), 2.0);
+        assert_eq!(cmp_ascending(&a, &b), Ordering::Less);
+    }
+
+    #[test]
+    fn breaks_ties_by_id() {
+        let a = Neighbor::new(VectorId::new(2), 1.0);
+        let b = Neighbor::new(VectorId::new(5), 1.0);
+        assert_eq!(cmp_ascending(&a, &b), Ordering::Less);
+        assert_eq!(cmp_ascending(&b, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn nan_sorts_last() {
+        let real = Neighbor::new(VectorId::new(1), 1.0);
+        let nan = Neighbor::new(VectorId::new(0), f32::NAN);
+        // total_cmp places NaN above any finite value, so the real neighbor is
+        // "less" (ranked better).
+        assert_eq!(cmp_ascending(&real, &nan), Ordering::Less);
     }
 
     #[test]
@@ -140,5 +223,22 @@ mod tests {
         let got = t.into_sorted_vec();
         let ids: Vec<u64> = got.iter().map(|x| x.id.get()).collect();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn worst_score_and_fullness_track_the_beam() {
+        let mut t = TopK::new(2);
+        assert!(!t.is_full());
+        assert_eq!(t.worst_score(), None);
+        t.offer(n(0, 3.0));
+        assert!(!t.is_full());
+        assert_eq!(t.worst_score(), Some(3.0));
+        t.offer(n(1, 1.0));
+        assert!(t.is_full());
+        assert_eq!(t.worst_score(), Some(3.0));
+        // A better candidate evicts the worst and lowers the cutoff.
+        t.offer(n(2, 2.0));
+        assert!(t.is_full());
+        assert_eq!(t.worst_score(), Some(2.0));
     }
 }

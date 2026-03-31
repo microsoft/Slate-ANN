@@ -16,6 +16,7 @@ mod dtype;
 mod error;
 mod id;
 mod metric;
+pub mod search;
 
 pub use config::{
     BuildConfig, HnswParams, IndexBackend, IoProfile, IvfParams, PqParams, SearchConfig,
@@ -26,3 +27,4 @@ pub use dtype::Dtype;
 pub use error::{Error, Result};
 pub use id::VectorId;
 pub use metric::Metric;
+pub use search::{cmp_ascending, Neighbor, TopK};

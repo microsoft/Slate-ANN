@@ -8,11 +8,8 @@
 //! Complexity is O(N · d) distance work and O(k) memory: vectors are decoded
 //! one at a time into a reusable scratch buffer, never all held at once.
 
-use slate_core::{Error, Metric, Result, SearchConfig, VectorId};
+use slate_core::{Error, Metric, Neighbor, Result, SearchConfig, TopK, VectorId};
 use slate_storage::{IoBackend, VectorStore};
-
-use crate::neighbor::Neighbor;
-use crate::topk::TopK;
 
 /// Brute-force exact KNN over an entire [`VectorStore`].
 ///
@@ -177,9 +174,8 @@ mod proptests {
     //! the recall oracle to a second, obviously-correct algorithm.
 
     use super::*;
-    use crate::neighbor::cmp_ascending;
     use proptest::prelude::*;
-    use slate_core::{Dtype, StorageParams};
+    use slate_core::{cmp_ascending, Dtype, StorageParams};
     use slate_storage::{BlockLayout, StoreWriter, VectorStore};
     use tempfile::NamedTempFile;
 
