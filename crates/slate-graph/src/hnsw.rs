@@ -29,6 +29,23 @@
 //! Neighbor selection here is the simple "closest first" heuristic; LEANN's
 //! high-degree-preserving pruning is a later phase. Distances follow the
 //! engine-wide ascending convention via [`slate_simd::distance`].
+//!
+//! # Two-level hybrid search (Phase 5)
+//!
+//! Built with [`HnswIndex::build_with_pq`], the index additionally trains a
+//! product-quantization [`slate_pq::PqCodebook`] and keeps every vector's
+//! compact PQ code resident in RAM. [`HnswIndex::search_hybrid`] then runs
+//! LEANN's two-level traversal: cheap **approximate** (ADC) distances, computed
+//! from the in-RAM codes with zero disk I/O, decide which nodes are worth an
+//! **exact** vector fetch from the [`VectorStore`]; the exact distances — the
+//! only ones trusted for ranking — drive the result set and which nodes are
+//! expanded. Approximate scores never enter the result ranking, only the
+//! fetch-gating decision, so the configured [`Metric`] still governs the final
+//! answer even though the PQ codebook is trained with subspace L2. The payoff
+//! is storage-access reduction: most discovered nodes are scored approximately
+//! and never incur a disk seek. Exact fetches are gathered into batches
+//! (`fetch_batch_size`) so the Phase 7 elevator scheduler can later coalesce
+//! their seeks; until then each is still priced as an independent read.
 
 use slate_core::{
     Error, Metric, Neighbor, QueryCounters, Result, SearchConfig, TopK, VectorId,
@@ -38,6 +55,13 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use crate::rng::SplitMix64;
+
+/// k-means iterations used to train the PQ codebook during a PQ-enabled build.
+const PQ_TRAIN_ITERS: usize = 25;
+
+/// Mixing constant so the PQ training seed is decorrelated from the graph seed
+/// while staying a deterministic function of it.
+const PQ_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Parameters controlling graph shape, mirroring [`slate_core::HnswParams`] but
 /// resolved into the fields the builder uses directly.
@@ -145,6 +169,14 @@ pub struct HnswIndex {
     metric: Metric,
     /// Resolved graph parameters.
     params: GraphParams,
+    /// PQ codebook for the approximate tier. `Some` only when the index was
+    /// built with [`HnswIndex::build_with_pq`]; required by
+    /// [`HnswIndex::search_hybrid`].
+    codebook: Option<slate_pq::PqCodebook>,
+    /// Flat PQ codes for every node (`codes[node * code_len ..]`), empty unless
+    /// a `codebook` is present. Resident in RAM so approximate distances cost
+    /// no disk I/O.
+    codes: Vec<u8>,
 }
 
 impl HnswIndex {
@@ -154,6 +186,10 @@ impl HnswIndex {
     /// the whole graph) deterministic. Vectors are read once from the store and
     /// held in RAM only for the duration of the build.
     ///
+    /// The resulting index has no PQ tier, so only [`HnswIndex::search`] (exact
+    /// streaming search) is available. Use [`HnswIndex::build_with_pq`] to also
+    /// enable [`HnswIndex::search_hybrid`].
+    ///
     /// # Errors
     ///
     /// Returns an error if the store's dtype is unsupported (non-`F32`) or a
@@ -162,6 +198,41 @@ impl HnswIndex {
         store: &VectorStore<B>,
         metric: Metric,
         params: &slate_core::HnswParams,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::build_inner(store, metric, params, None, seed)
+    }
+
+    /// Build an HNSW graph **and** a product-quantization tier over every vector
+    /// in `store`, enabling [`HnswIndex::search_hybrid`].
+    ///
+    /// The graph is identical to [`HnswIndex::build`] for the same `params` and
+    /// `seed`; additionally the PQ codebook is trained on the same in-RAM copy
+    /// of the vectors and every vector is encoded into a compact code kept
+    /// resident for the index's lifetime. `pq` must satisfy
+    /// `store.dimensions() % pq.num_subquantizers == 0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store's dtype is unsupported, a vector read
+    /// fails, or the PQ parameters are incompatible with the dimensionality.
+    pub fn build_with_pq<B: IoBackend>(
+        store: &VectorStore<B>,
+        metric: Metric,
+        params: &slate_core::HnswParams,
+        pq: &slate_core::PqParams,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::build_inner(store, metric, params, Some(pq), seed)
+    }
+
+    /// Shared build path. When `pq` is `Some` and the store is non-empty, trains
+    /// a PQ codebook on the resident vectors and encodes them all.
+    fn build_inner<B: IoBackend>(
+        store: &VectorStore<B>,
+        metric: Metric,
+        params: &slate_core::HnswParams,
+        pq: Option<&slate_core::PqParams>,
         seed: u64,
     ) -> Result<Self> {
         let dims = store.dimensions();
@@ -177,6 +248,25 @@ impl HnswIndex {
             store.get_into(i, &mut data[start..start + dims])?;
         }
 
+        // Train the PQ tier (if requested) while the vectors are resident, then
+        // encode them all. The PQ seed is derived from the graph seed so both
+        // are deterministic yet independent. An empty store has nothing to
+        // quantize, so it stays PQ-less (an empty hybrid search returns empty).
+        let (codebook, codes) = match pq {
+            Some(pq) if len > 0 => {
+                let cb = slate_pq::PqCodebook::train(
+                    &data,
+                    dims,
+                    pq,
+                    PQ_TRAIN_ITERS,
+                    seed ^ PQ_SEED_MIX,
+                )?;
+                let codes = cb.encode_batch(&data)?;
+                (Some(cb), codes)
+            }
+            _ => (None, Vec::new()),
+        };
+
         let mut index = Self {
             adjacency: vec![vec![Vec::new(); len]],
             node_levels: vec![0u8; len],
@@ -186,6 +276,8 @@ impl HnswIndex {
             dims,
             metric,
             params: gp,
+            codebook,
+            codes,
         };
 
         let mut rng = SplitMix64::new(seed);
@@ -214,6 +306,13 @@ impl HnswIndex {
     #[must_use]
     pub fn max_layer(&self) -> usize {
         self.max_layer
+    }
+
+    /// Whether this index carries a PQ tier (built via
+    /// [`HnswIndex::build_with_pq`]). [`HnswIndex::search_hybrid`] requires it.
+    #[must_use]
+    pub fn has_pq(&self) -> bool {
+        self.codebook.is_some()
     }
 
     /// Draw a level from the geometric distribution `floor(-ln(U) * mL)`.
@@ -581,6 +680,241 @@ impl HnswIndex {
             })
             .collect())
     }
+
+    /// Approximate (ADC) distance to node `b` from its in-RAM PQ code. Records
+    /// one approximate-distance evaluation and performs **no** disk I/O.
+    #[inline]
+    fn approx_dist(
+        &self,
+        adc: &slate_pq::AdcTable,
+        b: u32,
+        counters: &mut QueryCounters,
+    ) -> Result<f32> {
+        let d = adc.distance_at(&self.codes, b as usize)?;
+        counters.add_approx(1);
+        Ok(d)
+    }
+
+    /// Two-level hybrid search (LEANN): approximate PQ distances gate which
+    /// nodes get an exact disk fetch; exact distances rank results and steer
+    /// expansion. Returns the best `config.k` neighbors (ascending) with the
+    /// [`HnswStats`] accumulated during traversal.
+    ///
+    /// The upper layers are descended purely on approximate distances (no disk
+    /// I/O at all); only the dense layer 0 fetches exact vectors, and only for
+    /// the most promising approximate candidates. Approximate scores never enter
+    /// the result ranking — the configured [`Metric`] governs the final answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on dimension mismatch, a failed vector read, or if the
+    /// index was built without a PQ tier (use [`HnswIndex::build_with_pq`]).
+    pub fn search_hybrid<B: IoBackend>(
+        &self,
+        store: &VectorStore<B>,
+        query: &[f32],
+        config: &SearchConfig,
+    ) -> Result<(Vec<Neighbor>, HnswStats)> {
+        if query.len() != self.dims {
+            return Err(Error::DimensionMismatch {
+                expected: self.dims,
+                got: query.len(),
+            });
+        }
+        let mut counters = QueryCounters::new();
+
+        let Some(entry) = self.entry_point else {
+            // Empty graph (also the case for an empty PQ-requested build).
+            return Ok((Vec::new(), HnswStats { counters }));
+        };
+
+        let Some(codebook) = self.codebook.as_ref() else {
+            return Err(Error::unsupported(
+                "search_hybrid requires an index built with build_with_pq (no PQ tier present)",
+            ));
+        };
+
+        // Asymmetric distance table: the (un-quantized) query's subvectors vs
+        // each subspace's centroids. Built once, reused for every node.
+        let adc = slate_pq::AdcTable::build(codebook, query)?;
+
+        let vector_bytes = (self.dims * std::mem::size_of::<f32>()) as u64;
+        let mut scratch = vec![0.0f32; self.dims];
+
+        // Upper layers: greedy beam-1 descent on APPROXIMATE distance only. The
+        // PQ codes are in RAM, so the entire funnel down to layer 0 costs zero
+        // disk seeks; layer 0's exact ranking then corrects the entry choice.
+        let mut current = entry;
+        let mut current_approx = self.approx_dist(&adc, current, &mut counters)?;
+        let mut layer = self.max_layer;
+        while layer > 0 {
+            let mut improved = true;
+            while improved {
+                improved = false;
+                let neighbors = &self.adjacency[layer][current as usize];
+                for &nbr in neighbors {
+                    let d = self.approx_dist(&adc, nbr, &mut counters)?;
+                    if d < current_approx {
+                        current_approx = d;
+                        current = nbr;
+                        improved = true;
+                    }
+                }
+            }
+            layer -= 1;
+        }
+
+        // Layer 0: PQ-gated interleaved beam.
+        let ef = config.ef_search.max(config.k).max(1);
+        let results = self.search_layer_hybrid(
+            store,
+            query,
+            &adc,
+            current,
+            ef,
+            config,
+            &mut scratch,
+            &mut counters,
+            vector_bytes,
+        )?;
+
+        let mut topk = TopK::new(config.k);
+        for c in results {
+            topk.offer(Neighbor::new(VectorId::new(u64::from(c.node)), c.score));
+        }
+        Ok((topk.into_sorted_vec(), HnswStats { counters }))
+    }
+
+    /// Layer-0 PQ-gated hybrid search (LEANN two-level).
+    ///
+    /// Maintains three structures: an **approximate** frontier (min-heap by ADC
+    /// score) of discovered-but-unfetched nodes, an **exact** frontier
+    /// (min-heap by true distance) of fetched-but-unexpanded nodes, and the
+    /// bounded `ef` result set (max-heap by true distance). Each round promotes
+    /// the top `rerank_ratio` fraction of the approximate frontier (capped at
+    /// `fetch_batch_size`) to exact via batched disk reads, then expands the
+    /// closest exact node, scoring its neighbors approximately. The storage
+    /// saving is structural: nodes that never rank highly enough approximately
+    /// are never fetched.
+    #[allow(clippy::too_many_arguments)]
+    fn search_layer_hybrid<B: IoBackend>(
+        &self,
+        store: &VectorStore<B>,
+        query: &[f32],
+        adc: &slate_pq::AdcTable,
+        entry: u32,
+        ef: usize,
+        config: &SearchConfig,
+        scratch: &mut [f32],
+        counters: &mut QueryCounters,
+        vector_bytes: u64,
+    ) -> Result<Vec<Candidate>> {
+        // `discovered`: approximate score computed (queued or beyond).
+        // `exact_known`: exact distance already fetched.
+        let mut discovered = vec![false; self.len];
+        let mut exact_known = vec![false; self.len];
+
+        // Discovered, not yet fetched (min-heap by approximate score).
+        let mut approx_pq: BinaryHeap<Candidate> = BinaryHeap::new();
+        // Fetched, not yet expanded (min-heap by exact score).
+        let mut exact_frontier: BinaryHeap<Candidate> = BinaryHeap::new();
+        // Best `ef` by exact score (max-heap so the worst is evicted first).
+        let mut results: BinaryHeap<ResultEntry> = BinaryHeap::new();
+
+        discovered[entry as usize] = true;
+        let entry_approx = self.approx_dist(adc, entry, counters)?;
+        approx_pq.push(Candidate {
+            node: entry,
+            score: entry_approx,
+        });
+
+        let rerank_ratio = config.rerank_ratio;
+        let fetch_batch_size = config.fetch_batch_size.max(1);
+
+        loop {
+            // ---- FETCH PHASE: promote the most promising approximate
+            // candidates to exact, batched to amortize seeks. Take the top
+            // `rerank_ratio` fraction of the approximate frontier, capped by
+            // `fetch_batch_size`; always at least one so the search progresses.
+            let mut fetched_this_round = 0usize;
+            if !approx_pq.is_empty() {
+                let want = (approx_pq.len() as f32 * rerank_ratio).ceil() as usize;
+                let budget = want.clamp(1, fetch_batch_size);
+
+                // Gather the batch of node ids first; a future I/O scheduler
+                // (Phase 7) will issue these as one seek-ordered scatter read.
+                // Until then each is priced as an independent read by dist_disk.
+                let mut batch: Vec<u32> = Vec::with_capacity(budget);
+                while batch.len() < budget {
+                    let Some(cand) = approx_pq.pop() else {
+                        break;
+                    };
+                    if exact_known[cand.node as usize] {
+                        continue;
+                    }
+                    batch.push(cand.node);
+                }
+
+                for &node in &batch {
+                    let exact =
+                        self.dist_disk(store, query, node, scratch, counters, vector_bytes)?;
+                    exact_known[node as usize] = true;
+                    exact_frontier.push(Candidate { node, score: exact });
+                    results.push(ResultEntry { node, score: exact });
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                    fetched_this_round += 1;
+                }
+            }
+
+            // ---- EXPAND PHASE: expand the closest exact node; its graph
+            // neighbors get cheap approximate scores and join the approximate
+            // frontier for a future fetch decision.
+            let mut expanded_this_round = false;
+            if let Some(best) = exact_frontier.pop() {
+                // Best-first stop (exact vs exact — valid; approximate scores
+                // are never compared here): once the closest unexpanded exact
+                // node is no better than the worst kept result and the result
+                // set is full, no further expansion can improve it.
+                let can_improve = if results.len() >= ef {
+                    results.peek().is_none_or(|w| best.score <= w.score)
+                } else {
+                    true
+                };
+                if can_improve {
+                    expanded_this_round = true;
+                    let neighbors = &self.adjacency[0][best.node as usize];
+                    for &nbr in neighbors {
+                        if discovered[nbr as usize] {
+                            continue;
+                        }
+                        discovered[nbr as usize] = true;
+                        let a = self.approx_dist(adc, nbr, counters)?;
+                        approx_pq.push(Candidate { node: nbr, score: a });
+                    }
+                } else {
+                    // The exact frontier can no longer improve the results; the
+                    // remaining approximate candidates rank worse, so stop.
+                    break;
+                }
+            }
+
+            // ---- TERMINATION: no fetch and no expansion means both frontiers
+            // are exhausted of useful work.
+            if fetched_this_round == 0 && !expanded_this_round {
+                break;
+            }
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|r| Candidate {
+                node: r.node,
+                score: r.score,
+            })
+            .collect())
+    }
 }
 
 /// An entry in the bounded result set of a layer search, ordered for a max-heap
@@ -626,7 +960,7 @@ fn select_neighbors(candidates: &[Candidate], cap: usize) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slate_core::{Dtype, HnswParams, StorageParams};
+    use slate_core::{Dtype, HnswParams, PqParams, StorageParams};
     use slate_storage::{BlockLayout, StoreWriter, VectorStore};
     use tempfile::NamedTempFile;
 
@@ -666,6 +1000,166 @@ mod tests {
 
     fn default_params() -> HnswParams {
         HnswParams::default()
+    }
+
+    /// PQ config used by the hybrid tests: 4 subspaces of 4 dims each, 64
+    /// centroids per subspace — a healthy `n >> k` regime for the test sizes.
+    fn hybrid_pq() -> PqParams {
+        PqParams {
+            num_subquantizers: 4,
+            bits_per_code: 6,
+        }
+    }
+
+    #[test]
+    fn build_without_pq_has_none() {
+        let vectors = vec![vec![1.0, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]];
+        let (_tmp, store) = build_store(&vectors, 4);
+        let index = HnswIndex::build(&store, Metric::L2, &default_params(), 1).unwrap();
+        assert!(!index.has_pq());
+    }
+
+    #[test]
+    fn search_hybrid_without_pq_is_unsupported() {
+        let vectors = vec![vec![1.0, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]];
+        let (_tmp, store) = build_store(&vectors, 4);
+        let index = HnswIndex::build(&store, Metric::L2, &default_params(), 1).unwrap();
+        let cfg = SearchConfig::default();
+        let err = index
+            .search_hybrid(&store, &[1.0, 2.0, 3.0, 4.0], &cfg)
+            .unwrap_err();
+        // Robust against the exact error variant name.
+        assert!(
+            err.to_string().contains("build_with_pq"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hybrid_empty_graph_returns_empty() {
+        let (_tmp, store) = build_store(&[], 4);
+        let index = HnswIndex::build_with_pq(&store, Metric::L2, &default_params(), &hybrid_pq(), 1)
+            .unwrap();
+        assert!(!index.has_pq(), "empty store has nothing to quantize");
+        let cfg = SearchConfig::default();
+        let (res, stats) = index
+            .search_hybrid(&store, &[0.0, 0.0, 0.0, 0.0], &cfg)
+            .unwrap();
+        assert!(res.is_empty());
+        assert_eq!(stats.counters.nodes_visited, 0);
+    }
+
+    #[test]
+    fn hybrid_single_vector_is_its_own_nearest() {
+        let vectors = vec![vec![1.0, 2.0, 3.0, 4.0]];
+        let (_tmp, store) = build_store(&vectors, 4);
+        let index = HnswIndex::build_with_pq(&store, Metric::L2, &default_params(), &hybrid_pq(), 7)
+            .unwrap();
+        assert!(index.has_pq());
+        let cfg = SearchConfig {
+            k: 1,
+            ..SearchConfig::default()
+        };
+        let (res, _stats) = index
+            .search_hybrid(&store, &[1.0, 2.0, 3.0, 4.0], &cfg)
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, VectorId::new(0));
+        assert!(res[0].score.abs() < 1e-6);
+    }
+
+    #[test]
+    fn hybrid_recall_matches_oracle_and_saves_fetches() {
+        // Random vectors; the hybrid path must approach exact recall because the
+        // exact re-ranking governs the final ordering, while fetching far fewer
+        // than every vector from "disk".
+        let mut rng = SplitMix64::new(2025);
+        let dims = 16;
+        let n = 400;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.next_f64() as f32).collect())
+            .collect();
+        let (_tmp, store) = build_store(&vectors, dims);
+        let params = HnswParams {
+            m: 16,
+            m_max: 32,
+            ef_construction: 200,
+            ..HnswParams::default()
+        };
+        let index =
+            HnswIndex::build_with_pq(&store, Metric::L2, &params, &hybrid_pq(), 555).unwrap();
+
+        let k = 10;
+        let cfg = SearchConfig {
+            k,
+            ef_search: 64,
+            ..SearchConfig::default()
+        };
+
+        let queries = 30;
+        let mut total_recall = 0.0f64;
+        let mut total_approx = 0u64;
+        let mut total_exact = 0u64;
+        for q in 0..queries {
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+            let (res, stats) = index.search_hybrid(&store, &query, &cfg).unwrap();
+            let truth = naive_knn(&vectors, &query, Metric::L2, k);
+            let hits = res
+                .iter()
+                .filter(|nb| truth.contains(&nb.id.get()))
+                .count();
+            total_recall += hits as f64 / k as f64;
+
+            // Approximate distances must be recorded (the new cost term), and we
+            // must approximate-score at least as many nodes as we fetch exactly.
+            assert!(stats.counters.approx_distances > 0, "query {q}");
+            assert!(stats.counters.approx_distances >= stats.counters.exact_distances);
+            // Exact distances == disk fetches == nodes visited in this tier.
+            assert_eq!(stats.counters.exact_distances, stats.counters.nodes_visited);
+            // The whole point: not every vector is fetched from disk.
+            assert!(
+                stats.counters.exact_distances < n as u64,
+                "fetched {} of {n} vectors on query {q}",
+                stats.counters.exact_distances
+            );
+            total_approx += stats.counters.approx_distances;
+            total_exact += stats.counters.exact_distances;
+        }
+        let mean_recall = total_recall / queries as f64;
+        assert!(
+            mean_recall >= 0.80,
+            "hybrid recall@{k} too low: {mean_recall:.3}"
+        );
+        // Sanity: across all queries we genuinely skipped many exact fetches.
+        assert!(
+            total_exact < total_approx,
+            "no fetch saving: exact={total_exact} approx={total_approx}"
+        );
+    }
+
+    #[test]
+    fn hybrid_search_is_deterministic() {
+        let mut rng = SplitMix64::new(77);
+        let dims = 16;
+        let n = 200;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.next_f64() as f32).collect())
+            .collect();
+        let (_tmp, store) = build_store(&vectors, dims);
+        let index =
+            HnswIndex::build_with_pq(&store, Metric::L2, &default_params(), &hybrid_pq(), 9).unwrap();
+        let cfg = SearchConfig {
+            k: 10,
+            ef_search: 48,
+            ..SearchConfig::default()
+        };
+        let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+        let (a, sa) = index.search_hybrid(&store, &query, &cfg).unwrap();
+        let (b, sb) = index.search_hybrid(&store, &query, &cfg).unwrap();
+        let ids_a: Vec<u64> = a.iter().map(|n| n.id.get()).collect();
+        let ids_b: Vec<u64> = b.iter().map(|n| n.id.get()).collect();
+        assert_eq!(ids_a, ids_b);
+        assert_eq!(sa.counters, sb.counters);
     }
 
     #[test]

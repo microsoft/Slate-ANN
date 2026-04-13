@@ -792,6 +792,8 @@ name = "slate-pq"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "serde",
+ "serde_json",
  "slate-core",
  "slate-simd",
 ]
