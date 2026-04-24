@@ -26,9 +26,10 @@
 //! - **Search** descends the upper layers to layer 0, then runs a width-
 //!   `ef_search` best-first search there and returns the best `k`.
 //!
-//! Neighbor selection here is the simple "closest first" heuristic; LEANN's
-//! high-degree-preserving pruning is a later phase. Distances follow the
-//! engine-wide ascending convention via [`slate_simd::distance`].
+//! During construction neighbors are selected with the simple "closest first"
+//! heuristic; a post-build pass then applies LEANN's high-degree-preserving
+//! pruning (see below). Distances follow the engine-wide ascending convention
+//! via [`slate_simd::distance`].
 //!
 //! # Two-level hybrid search (Phase 5)
 //!
@@ -46,6 +47,26 @@
 //! and never incur a disk seek. Exact fetches are gathered into batches
 //! (`fetch_batch_size`) so the Phase 7 elevator scheduler can later coalesce
 //! their seeks; until then each is still priced as an independent read.
+//!
+//! # High-degree-preserving pruning (Phase 6)
+//!
+//! Traversal traffic in a navigable small-world graph is heavily skewed onto a
+//! small set of high-degree **hub** nodes. After the graph is fully built,
+//! [`HnswIndex::prune_high_degree`] classifies layer-0 nodes by accumulated
+//! out-degree: the top `hub_fraction` (LEANN β, default 2%) are hubs and keep
+//! their full out-degree (up to `m_max`); every other node is pruned back
+//! toward the base cap `m`. The critical rule (LEANN Algorithm 3) is that a
+//! pruned node keeps **all** of its out-edges that point at a hub — its
+//! on-ramps to the hub highways — and only its non-hub edges compete, closest
+//! first, for the leftover budget. This keeps the graph navigable at a much
+//! lower average degree, shrinking the stored edge set (and, indirectly, the
+//! number of nodes a query must fetch).
+//!
+//! The prune is **directed/asymmetric**: it shrinks only a node's own outgoing
+//! adjacency list and never touches the reverse edges other nodes hold toward
+//! it. That is exactly LEANN's CSR storage model, and since search only ever
+//! follows out-edges it remains correct. Only layer 0 is pruned; the sparse
+//! upper layers keep the plain `m` cap.
 
 use slate_core::{
     Error, Metric, Neighbor, QueryCounters, Result, SearchConfig, TopK, VectorId,
@@ -73,6 +94,8 @@ struct GraphParams {
     m_max: usize,
     /// Best-first beam width during construction.
     ef_construction: usize,
+    /// Fraction of layer-0 nodes preserved as full-degree hubs (LEANN β).
+    hub_fraction: f32,
     /// Level-generation normalization factor `mL = 1 / ln(m)`.
     level_mult: f64,
 }
@@ -88,6 +111,7 @@ impl GraphParams {
             m: p.m,
             m_max: p.m_max,
             ef_construction: p.ef_construction,
+            hub_fraction: p.hub_fraction,
             level_mult,
         }
     }
@@ -287,6 +311,10 @@ impl HnswIndex {
             index.insert_node(node as u32, level, &data)?;
         }
 
+        // LEANN high-degree-preserving pruning: a single post-build pass over
+        // layer 0, while the exact vectors are still resident in `data`.
+        index.prune_high_degree(&data)?;
+
         Ok(index)
     }
 
@@ -313,6 +341,16 @@ impl HnswIndex {
     #[must_use]
     pub fn has_pq(&self) -> bool {
         self.codebook.is_some()
+    }
+
+    /// Total number of directed edges stored on `layer` (sum of per-node
+    /// out-degrees). Returns 0 for a layer that does not exist. Primarily a
+    /// measurement hook for the storage win from high-degree-preserving pruning.
+    #[must_use]
+    pub fn edge_count(&self, layer: usize) -> usize {
+        self.adjacency
+            .get(layer)
+            .map_or(0, |nodes| nodes.iter().map(Vec::len).sum())
     }
 
     /// Draw a level from the geometric distribution `floor(-ln(U) * mL)`.
@@ -516,6 +554,110 @@ impl HnswIndex {
         }
         let kept = select_neighbors(&scored, cap);
         self.adjacency[layer][node as usize] = kept;
+        Ok(())
+    }
+
+    /// LEANN high-degree-preserving pruning: a single post-build pass over
+    /// layer 0 that trims each node's out-degree toward `m` while keeping the
+    /// densest `hub_fraction` of nodes ("navigation hubs") at full degree.
+    ///
+    /// Out-degrees in a navigable small-world graph are heavily skewed: a few
+    /// hub nodes accumulate many links and carry most of the routing. We exploit
+    /// that to shrink the stored graph (fewer CSR entries) without wrecking
+    /// recall:
+    ///
+    /// - **Hubs** — the top `hub_fraction` of layer-0 nodes by out-degree — keep
+    ///   all of their edges (already capped at `m_max` during construction).
+    /// - **Non-hubs** with degree above `m` are pruned to `m`, but with a twist:
+    ///   every out-edge that points *at a hub* is retained unconditionally (the
+    ///   "on-ramps" that keep low-degree nodes able to reach the highway), and
+    ///   the leftover budget is filled with the closest remaining neighbors.
+    ///
+    /// The prune is **directed**: only a node's own adjacency list is shortened;
+    /// the reverse edges held by its neighbors are left intact. Because search
+    /// only ever follows out-edges, this is sound, and it matches the
+    /// asymmetric, storage-minimizing CSR layout LEANN targets. Only layer 0 is
+    /// pruned; the sparse upper layers are already capped at `m`.
+    fn prune_high_degree(&mut self, data: &[f32]) -> Result<()> {
+        if self.len == 0 {
+            return Ok(());
+        }
+
+        // Out-degree of every node on the base layer.
+        let degrees: Vec<usize> = self.adjacency[0].iter().map(Vec::len).collect();
+
+        // How many nodes are preserved as full-degree hubs.
+        let hub_count = ((self.len as f32) * self.params.hub_fraction).round() as usize;
+        // hub_fraction large enough to cover every node ⇒ nothing to prune. This
+        // also makes `hub_fraction >= 1.0` an exact "no-prune" control.
+        if hub_count >= self.len {
+            return Ok(());
+        }
+
+        // The hubs are *exactly* the top `hub_count` nodes by out-degree, ties
+        // broken by node id for determinism. A plain degree threshold
+        // (`degree >= boundary`) is wrong: a saturated small-world graph has many
+        // nodes sharing the maximum degree, so `>=` would mark almost every node
+        // a hub and prune nothing. Capping the set at `hub_count` keeps the hub
+        // fraction honest regardless of degree ties.
+        let mut by_degree: Vec<u32> = (0..self.len as u32).collect();
+        by_degree.sort_unstable_by(|&a, &b| {
+            degrees[b as usize]
+                .cmp(&degrees[a as usize])
+                .then(a.cmp(&b))
+        });
+        let mut is_hub = vec![false; self.len];
+        for &u in by_degree.iter().take(hub_count) {
+            is_hub[u as usize] = true;
+        }
+
+        let m = self.params.m;
+        let m_max = self.params.m_max;
+
+        // Immutable pass: compute the trimmed list for each over-degree non-hub,
+        // then apply. Separating read from write keeps the borrow checker happy
+        // (we read `self.adjacency`/`data` while building `new_lists`).
+        let mut new_lists: Vec<(usize, Vec<u32>)> = Vec::new();
+        for u in 0..self.len {
+            if is_hub[u] || degrees[u] <= m {
+                continue;
+            }
+            let u_start = u * self.dims;
+            let u_vec = &data[u_start..u_start + self.dims];
+
+            // Always keep on-ramps to hubs; rank the rest by distance.
+            let mut hub_edges: Vec<u32> = Vec::new();
+            let mut other: Vec<Candidate> = Vec::new();
+            for &w in &self.adjacency[0][u] {
+                if is_hub[w as usize] {
+                    hub_edges.push(w);
+                } else {
+                    let d = self.dist_ram(u_vec, w, data)?;
+                    other.push(Candidate { node: w, score: d });
+                }
+            }
+
+            let budget = m.saturating_sub(hub_edges.len());
+            let mut kept = hub_edges;
+            kept.extend(select_neighbors(&other, budget));
+
+            // Guard the upper bound: keeping all hub on-ramps could in principle
+            // exceed m_max. If so, retain the closest m_max overall.
+            if kept.len() > m_max {
+                let mut scored: Vec<Candidate> = Vec::with_capacity(kept.len());
+                for &w in &kept {
+                    let d = self.dist_ram(u_vec, w, data)?;
+                    scored.push(Candidate { node: w, score: d });
+                }
+                kept = select_neighbors(&scored, m_max);
+            }
+
+            new_lists.push((u, kept));
+        }
+
+        for (u, kept) in new_lists {
+            self.adjacency[0][u] = kept;
+        }
         Ok(())
     }
 
@@ -1280,6 +1422,95 @@ mod tests {
         assert!(
             mean_recall >= 0.90,
             "mean recall@{k} was {mean_recall}, expected >= 0.90"
+        );
+    }
+
+    /// The post-build high-degree-preserving prune must actually shrink the
+    /// layer-0 edge set. We build the *same* graph twice and compare total
+    /// out-degree: `hub_fraction = 1.0` treats every node as a hub (the prune
+    /// is a no-op, our A/B control), while `hub_fraction = 0.02` prunes most
+    /// nodes back toward `m`. Fewer stored edges is the storage win.
+    fn clustered_vectors(seed: u64, n: usize, dims: usize) -> Vec<Vec<f32>> {
+        let mut rng = SplitMix64::new(seed);
+        (0..n)
+            .map(|_| (0..dims).map(|_| rng.next_f64() as f32).collect())
+            .collect()
+    }
+
+    #[test]
+    fn pruning_reduces_layer0_edges() {
+        let dims = 16;
+        let n = 400;
+        let vectors = clustered_vectors(2024, n, dims);
+        let (_tmp, store) = build_store(&vectors, dims);
+
+        let baseline_params = HnswParams {
+            m: 16,
+            m_max: 32,
+            ef_construction: 200,
+            hub_fraction: 1.0, // every node is a hub => prune is a no-op
+        };
+        let pruned_params = HnswParams {
+            hub_fraction: 0.02,
+            ..baseline_params
+        };
+
+        // Same seed => identical graph topology before the prune, so the only
+        // difference in edge count is the prune itself.
+        let baseline = HnswIndex::build(&store, Metric::L2, &baseline_params, 555).unwrap();
+        let pruned = HnswIndex::build(&store, Metric::L2, &pruned_params, 555).unwrap();
+
+        let baseline_edges = baseline.edge_count(0);
+        let pruned_edges = pruned.edge_count(0);
+        assert!(
+            pruned_edges < baseline_edges,
+            "pruned layer-0 edges ({pruned_edges}) must be < baseline ({baseline_edges})"
+        );
+    }
+
+    /// Pruning trades edges for storage but must not wreck recall: the hubs
+    /// plus preserved hub-pointing edges keep the graph navigable. This mirrors
+    /// `recall_is_high_on_clustered_data` but asserts a (slightly lower) floor
+    /// specifically under the default `hub_fraction = 0.02` prune.
+    #[test]
+    fn pruning_preserves_recall() {
+        let mut rng = SplitMix64::new(7);
+        let dims = 16;
+        let n = 400;
+        let vectors = clustered_vectors(4242, n, dims);
+        let (_tmp, store) = build_store(&vectors, dims);
+
+        // Default hub_fraction (0.02) => pruning is active.
+        let params = HnswParams {
+            m: 16,
+            m_max: 32,
+            ef_construction: 200,
+            ..HnswParams::default()
+        };
+        let index = HnswIndex::build(&store, Metric::L2, &params, 808).unwrap();
+        assert!(index.edge_count(0) > 0);
+
+        let k = 10;
+        let cfg = SearchConfig {
+            k,
+            ef_search: 64,
+            ..SearchConfig::default()
+        };
+
+        let queries = 30;
+        let mut total_recall = 0.0f64;
+        for _ in 0..queries {
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+            let (res, _stats) = index.search(&store, &query, &cfg).unwrap();
+            let truth = naive_knn(&vectors, &query, Metric::L2, k);
+            let truth_set: std::collections::HashSet<u64> = truth.into_iter().collect();
+            let hits = res.iter().filter(|n| truth_set.contains(&n.id.get())).count();
+            total_recall += hits as f64 / k as f64;
+        }
+        let mean_recall = total_recall / f64::from(queries);
+        assert!(
+            mean_recall >= 0.85,
+            "mean recall@{k} under pruning was {mean_recall}, expected >= 0.85"
         );
     }
 }
