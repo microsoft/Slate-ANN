@@ -761,6 +761,26 @@ impl HnswIndex {
         slate_simd::distance(self.metric, query, scratch)
     }
 
+    /// Exact distance to node `b` as part of a scheduler-planned batch: streams
+    /// the vector and counts the visit and the exact distance, but does **not**
+    /// charge the read. The batch's reads are charged once by the caller from
+    /// the coalesced [`slate_storage::FetchSchedule`], so summing per-vector
+    /// reads here would double-count and erase the seek-coalescing win.
+    #[inline]
+    fn dist_fetched<B: IoBackend>(
+        &self,
+        store: &VectorStore<B>,
+        query: &[f32],
+        b: u32,
+        scratch: &mut [f32],
+        counters: &mut QueryCounters,
+    ) -> Result<f32> {
+        store.get_into(b as usize, scratch)?;
+        counters.visit_node();
+        counters.add_exact(1);
+        slate_simd::distance(self.metric, query, scratch)
+    }
+
     /// Layer-0 best-first search reading exact vectors from the store.
     #[allow(clippy::too_many_arguments)]
     fn search_layer_disk<B: IoBackend>(
@@ -880,7 +900,6 @@ impl HnswIndex {
         // each subspace's centroids. Built once, reused for every node.
         let adc = slate_pq::AdcTable::build(codebook, query)?;
 
-        let vector_bytes = (self.dims * std::mem::size_of::<f32>()) as u64;
         let mut scratch = vec![0.0f32; self.dims];
 
         // Upper layers: greedy beam-1 descent on APPROXIMATE distance only. The
@@ -917,7 +936,6 @@ impl HnswIndex {
             config,
             &mut scratch,
             &mut counters,
-            vector_bytes,
         )?;
 
         let mut topk = TopK::new(config.k);
@@ -949,7 +967,6 @@ impl HnswIndex {
         config: &SearchConfig,
         scratch: &mut [f32],
         counters: &mut QueryCounters,
-        vector_bytes: u64,
     ) -> Result<Vec<Candidate>> {
         // `discovered`: approximate score computed (queued or beyond).
         // `exact_known`: exact distance already fetched.
@@ -983,9 +1000,10 @@ impl HnswIndex {
                 let want = (approx_pq.len() as f32 * rerank_ratio).ceil() as usize;
                 let budget = want.clamp(1, fetch_batch_size);
 
-                // Gather the batch of node ids first; a future I/O scheduler
-                // (Phase 7) will issue these as one seek-ordered scatter read.
-                // Until then each is priced as an independent read by dist_disk.
+                // Gather the batch of node ids first, then hand them to the
+                // elevator scheduler: it sorts them into physical-offset order
+                // and coalesces same/adjacent-block reads, so the whole batch
+                // costs one seek per sequential run instead of one per vector.
                 let mut batch: Vec<u32> = Vec::with_capacity(budget);
                 while batch.len() < budget {
                     let Some(cand) = approx_pq.pop() else {
@@ -997,16 +1015,28 @@ impl HnswIndex {
                     batch.push(cand.node);
                 }
 
-                for &node in &batch {
-                    let exact =
-                        self.dist_disk(store, query, node, scratch, counters, vector_bytes)?;
-                    exact_known[node as usize] = true;
-                    exact_frontier.push(Candidate { node, score: exact });
-                    results.push(ResultEntry { node, score: exact });
-                    if results.len() > ef {
-                        results.pop();
+                if !batch.is_empty() {
+                    let indices: Vec<usize> = batch.iter().map(|&n| n as usize).collect();
+                    let plan = slate_storage::FetchSchedule::plan(store.layout(), &indices);
+
+                    // Read in seek order; `dist_fetched` counts the visit and
+                    // the exact distance but not the read — the batch's reads
+                    // are charged once below from the coalesced plan.
+                    for &idx in plan.order() {
+                        let node = idx as u32;
+                        let exact = self.dist_fetched(store, query, node, scratch, counters)?;
+                        exact_known[node as usize] = true;
+                        exact_frontier.push(Candidate { node, score: exact });
+                        results.push(ResultEntry { node, score: exact });
+                        if results.len() > ef {
+                            results.pop();
+                        }
+                        fetched_this_round += 1;
                     }
-                    fetched_this_round += 1;
+
+                    // One coalesced storage charge for the whole batch: the same
+                    // payload bytes, but only `plan.seeks()` head positionings.
+                    counters.add_read(plan.bytes(), plan.seeks(), plan.runs());
                 }
             }
 
@@ -1277,6 +1307,149 @@ mod tests {
             total_exact < total_approx,
             "no fetch saving: exact={total_exact} approx={total_approx}"
         );
+    }
+
+    /// Build a store with an explicit (small) block size so vectors span many
+    /// physical blocks — the regime where the elevator scheduler's coalescing
+    /// is non-trivial. Mirrors `build_store` otherwise.
+    fn build_store_blocked(
+        vectors: &[Vec<f32>],
+        dims: usize,
+        block_size: usize,
+    ) -> (NamedTempFile, VectorStore<slate_storage::MmapBackend>) {
+        let tmp = NamedTempFile::new().unwrap();
+        let layout = BlockLayout::new(Dtype::F32, dims, block_size).unwrap();
+        let mut writer = StoreWriter::create(tmp.path(), layout).unwrap();
+        for v in vectors {
+            writer.push(v).unwrap();
+        }
+        writer.finish().unwrap();
+        let store = VectorStore::open_mmap(tmp.path()).unwrap();
+        (tmp, store)
+    }
+
+    #[test]
+    fn hybrid_fetch_holds_seek_invariants() {
+        // The Phase-7 elevator scheduler must never need more seeks than vectors
+        // fetched, must report runs == seeks, and must keep the payload-byte
+        // accounting (bytes_read == exact * vector_bytes) intact — all while the
+        // exact ranking still governs recall.
+        let mut rng = SplitMix64::new(2025);
+        let dims = 16;
+        let n = 400;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.next_f64() as f32).collect())
+            .collect();
+        let (_tmp, store) = build_store(&vectors, dims);
+        let params = HnswParams {
+            m: 16,
+            m_max: 32,
+            ef_construction: 200,
+            ..HnswParams::default()
+        };
+        let index =
+            HnswIndex::build_with_pq(&store, Metric::L2, &params, &hybrid_pq(), 555).unwrap();
+
+        let k = 10;
+        let cfg = SearchConfig {
+            k,
+            ef_search: 64,
+            ..SearchConfig::default()
+        };
+        let vector_bytes = (dims * std::mem::size_of::<f32>()) as u64;
+
+        let queries = 30;
+        let mut total_recall = 0.0f64;
+        for _ in 0..queries {
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+            let (res, stats) = index.search_hybrid(&store, &query, &cfg).unwrap();
+            let c = stats.counters;
+
+            // Never more seeks than vectors fetched; runs mirror seeks.
+            assert!(
+                c.seeks <= c.exact_distances,
+                "seeks {} exceeded fetches {}",
+                c.seeks,
+                c.exact_distances
+            );
+            assert_eq!(c.sequential_runs, c.seeks, "runs must equal seeks");
+            // Payload accounting unchanged by coalescing.
+            assert_eq!(c.bytes_read, c.exact_distances * vector_bytes);
+            // If anything was fetched, at least one seek was issued.
+            if c.exact_distances > 0 {
+                assert!(c.seeks >= 1);
+            }
+
+            let truth = naive_knn(&vectors, &query, Metric::L2, k);
+            let hits = res
+                .iter()
+                .filter(|nb| truth.contains(&nb.id.get()))
+                .count();
+            total_recall += hits as f64 / k as f64;
+        }
+        let mean_recall = total_recall / queries as f64;
+        assert!(mean_recall >= 0.80, "recall@{k} too low: {mean_recall:.3}");
+    }
+
+    #[test]
+    fn hybrid_fetch_coalesces_seeks_across_blocks() {
+        // With a small block size the vectors span many blocks, so naive demand
+        // paging would seek once per fetched vector. The elevator scheduler
+        // sorts and coalesces each batch, so the total seek count must come in
+        // strictly below the number of vectors fetched — the Phase-7 win — while
+        // recall is unaffected (the exact metric still ranks results).
+        let mut rng = SplitMix64::new(2025);
+        let dims = 16;
+        let n = 400;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.next_f64() as f32).collect())
+            .collect();
+        // 16-dim f32 = 64 bytes/vector; 256-byte blocks => 4 vectors/block, so
+        // the 400 vectors occupy 100 blocks and a fetch batch can straddle them.
+        let (_tmp, store) = build_store_blocked(&vectors, dims, 256);
+        let params = HnswParams {
+            m: 16,
+            m_max: 32,
+            ef_construction: 200,
+            ..HnswParams::default()
+        };
+        let index =
+            HnswIndex::build_with_pq(&store, Metric::L2, &params, &hybrid_pq(), 555).unwrap();
+
+        let k = 10;
+        let cfg = SearchConfig {
+            k,
+            ef_search: 64,
+            ..SearchConfig::default()
+        };
+
+        let queries = 30;
+        let mut total_seeks = 0u64;
+        let mut total_exact = 0u64;
+        let mut total_recall = 0.0f64;
+        for _ in 0..queries {
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+            let (res, stats) = index.search_hybrid(&store, &query, &cfg).unwrap();
+            let c = stats.counters;
+            assert!(c.seeks <= c.exact_distances);
+            total_seeks += c.seeks;
+            total_exact += c.exact_distances;
+
+            let truth = naive_knn(&vectors, &query, Metric::L2, k);
+            let hits = res
+                .iter()
+                .filter(|nb| truth.contains(&nb.id.get()))
+                .count();
+            total_recall += hits as f64 / k as f64;
+        }
+        // Coalescing must save seeks in aggregate: strictly fewer seeks than
+        // vectors fetched across all queries.
+        assert!(
+            total_seeks < total_exact,
+            "no coalescing: seeks={total_seeks} fetches={total_exact}"
+        );
+        let mean_recall = total_recall / queries as f64;
+        assert!(mean_recall >= 0.80, "recall@{k} too low: {mean_recall:.3}");
     }
 
     #[test]
