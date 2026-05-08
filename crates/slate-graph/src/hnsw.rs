@@ -67,13 +67,29 @@
 //! it. That is exactly LEANN's CSR storage model, and since search only ever
 //! follows out-edges it remains correct. Only layer 0 is pruned; the sparse
 //! upper layers keep the plain `m` cap.
+//!
+//! # Graph-aware layout ordering (Phase 7 continuation)
+//!
+//! The elevator scheduler ([`slate_storage::FetchSchedule`]) can only coalesce
+//! fetches that land on the same or adjacent disk blocks, so its payoff depends
+//! on **where vectors physically sit**. [`HnswIndex::layout_order`] derives a
+//! Cuthill–McKee-style breadth-first permutation of the layer-0 graph from the
+//! entry point; mapping that order onto ascending dense ids (which are ascending
+//! block offsets) places graph-adjacent nodes in nearby blocks, so a query's
+//! frontier collapses onto few blocks and the scheduler turns them into long
+//! sequential runs. [`HnswIndex::relabel`] applies a permutation as a pure
+//! renaming of node ids — the graph is unchanged, so search results are
+//! identical after mapping ids back, i.e. **fixed recall, fewer seeks**.
+//! [`write_reordered_store`] rewrites the backing store in the new order so the
+//! relabeled ids again match their rows.
 
 use slate_core::{
     Error, Metric, Neighbor, QueryCounters, Result, SearchConfig, TopK, VectorId,
 };
-use slate_storage::{IoBackend, VectorStore};
+use slate_storage::{BlockLayout, IoBackend, StoreWriter, VectorStore};
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
+use std::path::Path;
 
 use crate::rng::SplitMix64;
 
@@ -351,6 +367,193 @@ impl HnswIndex {
         self.adjacency
             .get(layer)
             .map_or(0, |nodes| nodes.iter().map(Vec::len).sum())
+    }
+
+    /// Number of layer-0 directed edges whose endpoints fall in **different**
+    /// blocks under `layout`, counting each node by its current id (== its dense
+    /// store row). This is exactly the traffic the elevator scheduler cannot
+    /// coalesce away: an edge inside a block is free to co-fetch, an edge that
+    /// crosses a block boundary may cost a seek. Lower is better; reordering the
+    /// store by [`HnswIndex::layout_order`] is what drives it down.
+    #[must_use]
+    pub fn cross_block_edges(&self, layout: &BlockLayout) -> usize {
+        let Some(layer0) = self.adjacency.first() else {
+            return 0;
+        };
+        let mut crossings = 0;
+        for (u, neighbors) in layer0.iter().enumerate() {
+            let bu = layout.block_of(u);
+            for &w in neighbors {
+                if layout.block_of(w as usize) != bu {
+                    crossings += 1;
+                }
+            }
+        }
+        crossings
+    }
+
+    /// Compute a graph-aware layout order: a permutation `order` where
+    /// `order[new_id] = old_id`, chosen so that graph-adjacent nodes receive
+    /// nearby new ids (hence nearby disk blocks).
+    ///
+    /// The order is a Cuthill–McKee-style breadth-first sweep of the layer-0
+    /// adjacency, seeded at the entry point (the node every query descends
+    /// through) and expanding each node's neighbours in ascending-degree, then
+    /// ascending-id order. Any nodes not reached from the entry point — and the
+    /// whole graph when there is no entry point — are appended in id order, so
+    /// the result is always a total permutation of `0..len`.
+    #[must_use]
+    pub fn layout_order(&self) -> Vec<u32> {
+        let n = self.len;
+        let mut order = Vec::with_capacity(n);
+        if n == 0 {
+            return order;
+        }
+        let layer0 = match self.adjacency.first() {
+            Some(layer0) => layer0,
+            None => return (0..n as u32).collect(),
+        };
+
+        let mut visited = vec![false; n];
+        let mut queue: VecDeque<u32> = VecDeque::new();
+
+        // Visit BFS roots in this order: the entry point first, then every node
+        // in ascending id as a fallback for disconnected components.
+        let roots = self
+            .entry_point
+            .into_iter()
+            .chain(0..n as u32);
+
+        for root in roots {
+            if visited[root as usize] {
+                continue;
+            }
+            visited[root as usize] = true;
+            queue.push_back(root);
+            while let Some(u) = queue.pop_front() {
+                order.push(u);
+                // Expand neighbours closest-to-the-graph-core first: ascending
+                // degree, ties broken by id, for a deterministic CM-style sweep.
+                let mut neighbors: Vec<u32> = layer0[u as usize].clone();
+                neighbors.sort_unstable_by_key(|&w| (layer0[w as usize].len(), w));
+                for w in neighbors {
+                    if !visited[w as usize] {
+                        visited[w as usize] = true;
+                        queue.push_back(w);
+                    }
+                }
+            }
+        }
+
+        debug_assert_eq!(order.len(), n, "layout_order must be a permutation");
+        order
+    }
+
+    /// Return a copy of this index with its node ids permuted by `order`
+    /// (`order[new_id] = old_id`). This is a pure renaming: adjacency, node
+    /// levels, the entry point and the PQ codes are all rewritten in terms of
+    /// the new ids, but the graph's *structure* — and therefore every search
+    /// result, once ids are mapped back — is unchanged.
+    ///
+    /// Pair it with [`write_reordered_store`] over the same `order` so the
+    /// relabeled ids line up with their rows in the rewritten store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] if `order` is not a permutation of
+    /// `0..len`.
+    pub fn relabel(&self, order: &[u32]) -> Result<Self> {
+        let n = self.len;
+        if order.len() != n {
+            return Err(Error::invalid_config(
+                "layout order length must equal the node count",
+            ));
+        }
+
+        // Inverse map: pos[old] = new. Building it also validates that `order`
+        // is a genuine permutation (each old id appears exactly once, in range).
+        let mut pos = vec![u32::MAX; n];
+        for (new, &old) in order.iter().enumerate() {
+            let old = old as usize;
+            if old >= n || pos[old] != u32::MAX {
+                return Err(Error::invalid_config(
+                    "layout order must be a permutation of 0..len",
+                ));
+            }
+            pos[old] = new as u32;
+        }
+
+        // Remap every layer. Each layer vec is sized `len` and indexed by global
+        // id (see `insert_node`), so node `old` moves to slot `pos[old]` and each
+        // neighbour id `w` is rewritten to `pos[w]`.
+        let mut adjacency = Vec::with_capacity(self.adjacency.len());
+        for layer in &self.adjacency {
+            let mut new_layer = vec![Vec::new(); n];
+            for (old, neighbors) in layer.iter().enumerate() {
+                let mut remapped: Vec<u32> =
+                    neighbors.iter().map(|&w| pos[w as usize]).collect();
+                // Neighbour order within a list is not semantically meaningful,
+                // but sorting keeps relabel deterministic and diff-friendly.
+                remapped.sort_unstable();
+                new_layer[pos[old] as usize] = remapped;
+            }
+            adjacency.push(new_layer);
+        }
+
+        let mut node_levels = vec![0u8; n];
+        for (old, &level) in self.node_levels.iter().enumerate() {
+            node_levels[pos[old] as usize] = level;
+        }
+
+        // Relocate the flat PQ codes block-for-block, if present.
+        let codes = if self.codes.is_empty() {
+            Vec::new()
+        } else {
+            let code_len = self.codes.len() / n;
+            let mut codes = vec![0u8; self.codes.len()];
+            for (old, &new) in pos.iter().enumerate() {
+                let new = new as usize;
+                codes[new * code_len..][..code_len]
+                    .copy_from_slice(&self.codes[old * code_len..][..code_len]);
+            }
+            codes
+        };
+
+        let entry_point = self.entry_point.map(|ep| pos[ep as usize]);
+
+        Ok(Self {
+            adjacency,
+            node_levels,
+            entry_point,
+            max_layer: self.max_layer,
+            len: n,
+            dims: self.dims,
+            metric: self.metric,
+            params: self.params,
+            codebook: self.codebook.clone(),
+            codes,
+        })
+    }
+
+    /// Compute a graph-aware [`HnswIndex::layout_order`], rewrite `src` into a
+    /// new store at `dst` in that order, and return the index relabeled to match.
+    ///
+    /// After this call the caller should reopen `dst` (e.g. with
+    /// [`VectorStore::open_mmap`]) as the backing store for the returned index;
+    /// row `new_id` of `dst` holds the vector for relabeled node `new_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a source row cannot be read, the destination cannot
+    /// be written, or relabeling fails.
+    pub fn reorder_for_layout<B: IoBackend>(
+        &self,
+        src: &VectorStore<B>,
+        dst: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let order = self.layout_order();
+        write_reordered_store(src, &order, dst)?;
+        self.relabel(&order)
     }
 
     /// Draw a level from the geometric distribution `floor(-ln(U) * mL)`.
@@ -1129,6 +1332,50 @@ fn select_neighbors(candidates: &[Candidate], cap: usize) -> Vec<u32> {
     sorted.into_iter().map(|c| c.node).collect()
 }
 
+/// Rewrite `src` into a brand-new store at `dst`, permuting rows by `order`
+/// (`order[new_id] = old_id`): row `new_id` of the output holds the vector
+/// `src` stored at row `order[new_id]`. The output reuses `src`'s exact block
+/// geometry (dtype, dimensions, block size), so it is a drop-in replacement
+/// backing store for an index relabeled by the same `order`.
+///
+/// This is the on-disk half of graph-aware layout; see [`HnswIndex::relabel`]
+/// for the in-memory half and [`HnswIndex::reorder_for_layout`] for both at once.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidConfig`] if `order` is not a permutation of
+/// `0..src.len()`, or an I/O error if a row cannot be read or written.
+pub fn write_reordered_store<B: IoBackend>(
+    src: &VectorStore<B>,
+    order: &[u32],
+    dst: impl AsRef<Path>,
+) -> Result<()> {
+    let n = src.len();
+    if order.len() != n {
+        return Err(Error::invalid_config(
+            "layout order length must equal the store row count",
+        ));
+    }
+
+    let dims = src.dimensions();
+    let mut writer = StoreWriter::create(dst, *src.layout())?;
+    let mut scratch = vec![0.0f32; dims];
+    let mut seen = vec![false; n];
+    for &old in order {
+        let old = old as usize;
+        if old >= n || seen[old] {
+            return Err(Error::invalid_config(
+                "layout order must be a permutation of 0..len",
+            ));
+        }
+        seen[old] = true;
+        src.get_into(old, &mut scratch)?;
+        writer.push(&scratch)?;
+    }
+    writer.finish()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1448,6 +1695,168 @@ mod tests {
             total_seeks < total_exact,
             "no coalescing: seeks={total_seeks} fetches={total_exact}"
         );
+        let mean_recall = total_recall / queries as f64;
+        assert!(mean_recall >= 0.80, "recall@{k} too low: {mean_recall:.3}");
+    }
+
+    #[test]
+    fn layout_order_is_a_permutation() {
+        let mut rng = SplitMix64::new(2024);
+        let dims = 16;
+        let n = 400;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.next_f64() as f32).collect())
+            .collect();
+        let (_tmp, store) = build_store(&vectors, dims);
+        let index = HnswIndex::build(&store, Metric::L2, &default_params(), 555).unwrap();
+
+        let order = index.layout_order();
+        assert_eq!(order.len(), n);
+        // Every id in 0..n appears exactly once.
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert!(sorted.iter().copied().eq(0..n as u32));
+        // The entry point leads the order (BFS is seeded there).
+        // (Only assert when there is an entry point, i.e. non-empty graph.)
+        assert_eq!(order.is_empty(), index.is_empty());
+    }
+
+    #[test]
+    fn relabel_identity_is_a_noop() {
+        // Relabeling by the identity permutation must change nothing observable:
+        // same edge set, same cross-block count, same search results. Guards the
+        // remap arithmetic.
+        let mut rng = SplitMix64::new(99);
+        let dims = 16;
+        let n = 200;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.next_f64() as f32).collect())
+            .collect();
+        let (_tmp, store) = build_store(&vectors, dims);
+        let index = HnswIndex::build(&store, Metric::L2, &default_params(), 7).unwrap();
+
+        let identity: Vec<u32> = (0..n as u32).collect();
+        let same = index.relabel(&identity).unwrap();
+
+        let layout = BlockLayout::new(Dtype::F32, dims, 256).unwrap();
+        assert_eq!(same.edge_count(0), index.edge_count(0));
+        assert_eq!(
+            same.cross_block_edges(&layout),
+            index.cross_block_edges(&layout)
+        );
+
+        let cfg = SearchConfig {
+            k: 10,
+            ef_search: 64,
+            ..SearchConfig::default()
+        };
+        let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+        let (a, _) = index.search(&store, &query, &cfg).unwrap();
+        let (b, _) = same.search(&store, &query, &cfg).unwrap();
+        let ids_a: Vec<u64> = a.iter().map(|nb| nb.id.get()).collect();
+        let ids_b: Vec<u64> = b.iter().map(|nb| nb.id.get()).collect();
+        assert_eq!(ids_a, ids_b);
+    }
+
+    #[test]
+    fn relabel_preserves_search_results() {
+        // Graph-aware layout is a pure renaming: after rewriting the store in the
+        // new order and relabeling the graph, exact search must return the *same*
+        // neighbours as before — once the new ids are mapped back through the
+        // permutation. This is claim #2's "fixed recall, fixed hops".
+        let mut rng = SplitMix64::new(2025);
+        let dims = 16;
+        let n = 400;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.next_f64() as f32).collect())
+            .collect();
+        let (_tmp, store) = build_store(&vectors, dims);
+        let index = HnswIndex::build(&store, Metric::L2, &default_params(), 555).unwrap();
+
+        // Exercise the standalone planner + store rewriter + relabel directly.
+        let order = index.layout_order();
+        let dst = NamedTempFile::new().unwrap();
+        write_reordered_store(&store, &order, dst.path()).unwrap();
+        let new_store = VectorStore::open_mmap(dst.path()).unwrap();
+        let reordered = index.relabel(&order).unwrap();
+
+        let cfg = SearchConfig {
+            k: 10,
+            ef_search: 64,
+            ..SearchConfig::default()
+        };
+        for _ in 0..30 {
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+            let (orig, _) = index.search(&store, &query, &cfg).unwrap();
+            let (relab, _) = reordered.search(&new_store, &query, &cfg).unwrap();
+            // Map each relabeled result id back to its original id.
+            let mapped: Vec<u64> = relab
+                .iter()
+                .map(|nb| u64::from(order[nb.id.get() as usize]))
+                .collect();
+            let orig_ids: Vec<u64> = orig.iter().map(|nb| nb.id.get()).collect();
+            assert_eq!(mapped, orig_ids, "relabel changed the neighbour set");
+        }
+    }
+
+    #[test]
+    fn reorder_for_layout_improves_locality_and_keeps_recall() {
+        // End-to-end: the convenience path (plan order + rewrite store + relabel)
+        // must strictly reduce the layer-0 cross-block edge count on the real
+        // (small-block) store geometry — the quantity the scheduler cannot
+        // coalesce — while hybrid recall is unaffected.
+        let mut rng = SplitMix64::new(2025);
+        let dims = 16;
+        let n = 400;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.next_f64() as f32).collect())
+            .collect();
+        // 64 bytes/vector, 256-byte blocks => 4 vectors/block over 100 blocks.
+        let (_tmp, store) = build_store_blocked(&vectors, dims, 256);
+        let params = HnswParams {
+            m: 16,
+            m_max: 32,
+            ef_construction: 200,
+            ..HnswParams::default()
+        };
+        let index =
+            HnswIndex::build_with_pq(&store, Metric::L2, &params, &hybrid_pq(), 555).unwrap();
+
+        let before = index.cross_block_edges(store.layout());
+
+        // `reorder_for_layout` plans this same (deterministic) order internally;
+        // recompute it here so we can map relabeled ids back for the oracle.
+        let order = index.layout_order();
+        let dst = NamedTempFile::new().unwrap();
+        let reordered = index.reorder_for_layout(&store, dst.path()).unwrap();
+        let new_store = VectorStore::open_mmap(dst.path()).unwrap();
+        assert!(reordered.has_pq(), "PQ tier must survive relabel");
+
+        let after = reordered.cross_block_edges(new_store.layout());
+        assert!(
+            after < before,
+            "layout did not improve locality: before={before} after={after}"
+        );
+
+        // Recall on the reordered store still matches the oracle.
+        let k = 10;
+        let cfg = SearchConfig {
+            k,
+            ef_search: 64,
+            ..SearchConfig::default()
+        };
+        let queries = 30;
+        let mut total_recall = 0.0f64;
+        for _ in 0..queries {
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+            let (res, _) = reordered.search_hybrid(&new_store, &query, &cfg).unwrap();
+            let truth = naive_knn(&vectors, &query, Metric::L2, k);
+            let hits = res
+                .iter()
+                .filter(|nb| truth.contains(&u64::from(order[nb.id.get() as usize])))
+                .count();
+            total_recall += hits as f64 / k as f64;
+        }
         let mean_recall = total_recall / queries as f64;
         assert!(mean_recall >= 0.80, "recall@{k} too low: {mean_recall:.3}");
     }
