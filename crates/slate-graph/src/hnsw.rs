@@ -894,7 +894,9 @@ impl HnswIndex {
             return Ok((Vec::new(), HnswStats { counters }));
         };
 
-        let vector_bytes = (self.dims * std::mem::size_of::<f32>()) as u64;
+        // Price reads by the store's actual on-disk footprint so narrow dtypes
+        // (f16/i8) are accounted correctly; for f32 this is `dims * 4`.
+        let vector_bytes = store.layout().vector_bytes() as u64;
         let mut scratch = vec![0.0f32; self.dims];
 
         // Descend the upper layers greedily (beam width 1) to find a good entry
@@ -1573,6 +1575,103 @@ mod tests {
         writer.finish().unwrap();
         let store = VectorStore::open_mmap(tmp.path()).unwrap();
         (tmp, store)
+    }
+
+    fn build_store_dtype(
+        vectors: &[Vec<f32>],
+        dims: usize,
+        dtype: Dtype,
+        block_size: usize,
+    ) -> (NamedTempFile, VectorStore<slate_storage::MmapBackend>) {
+        let tmp = NamedTempFile::new().unwrap();
+        let layout = BlockLayout::new(dtype, dims, block_size).unwrap();
+        let mut writer = StoreWriter::create(tmp.path(), layout).unwrap();
+        for v in vectors {
+            writer.push(v).unwrap();
+        }
+        writer.finish().unwrap();
+        let store = VectorStore::open_mmap(tmp.path()).unwrap();
+        (tmp, store)
+    }
+
+    /// Build one f32 and one narrow store from the SAME vectors, run hybrid
+    /// search over both, and return (f32_total_bytes, narrow_total_bytes,
+    /// narrow_mean_recall). Truth is computed on the original f32 vectors.
+    fn narrow_vs_f32(
+        dtype: Dtype,
+        block_size: usize,
+    ) -> (u64, u64, f64) {
+        let mut rng = SplitMix64::new(2025);
+        let dims = 16;
+        let n = 400;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.next_f64() as f32).collect())
+            .collect();
+        let (_f32_tmp, f32_store) = build_store_blocked(&vectors, dims, block_size);
+        let (_nar_tmp, nar_store) = build_store_dtype(&vectors, dims, dtype, block_size);
+        let params = HnswParams {
+            m: 16,
+            m_max: 32,
+            ef_construction: 200,
+            ..HnswParams::default()
+        };
+        // Build the graph on the f32 store (topology is dtype-independent), then
+        // search both stores with the same index — the only difference is the
+        // bytes moved and the precision of the streamed exact vectors.
+        let f32_index =
+            HnswIndex::build_with_pq(&f32_store, Metric::L2, &params, &hybrid_pq(), 555).unwrap();
+        let nar_index =
+            HnswIndex::build_with_pq(&nar_store, Metric::L2, &params, &hybrid_pq(), 555).unwrap();
+
+        let k = 10;
+        let cfg = SearchConfig {
+            k,
+            ef_search: 64,
+            ..SearchConfig::default()
+        };
+        let nar_vbytes = nar_store.layout().vector_bytes() as u64;
+
+        let queries = 30;
+        let mut f32_bytes = 0u64;
+        let mut nar_bytes = 0u64;
+        let mut total_recall = 0.0f64;
+        for _ in 0..queries {
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+            let (_fr, fs) = f32_index.search_hybrid(&f32_store, &query, &cfg).unwrap();
+            let (nr, ns) = nar_index.search_hybrid(&nar_store, &query, &cfg).unwrap();
+            f32_bytes += fs.counters.bytes_read;
+            nar_bytes += ns.counters.bytes_read;
+            // Narrow byte accounting must equal fetches * stored footprint.
+            assert_eq!(
+                ns.counters.bytes_read,
+                ns.counters.exact_distances * nar_vbytes
+            );
+            let truth = naive_knn(&vectors, &query, Metric::L2, k);
+            let hits = nr.iter().filter(|nb| truth.contains(&nb.id.get())).count();
+            total_recall += hits as f64 / k as f64;
+        }
+        (f32_bytes, nar_bytes, total_recall / queries as f64)
+    }
+
+    #[test]
+    fn hybrid_on_f16_store_keeps_recall_and_cuts_bytes() {
+        // 4 vectors/block (block_size 256, dims 16 f32 => 64 B/vec) so fetches
+        // span many blocks; f16 halves the bytes moved with near-lossless recall.
+        let (f32_bytes, f16_bytes, recall) = narrow_vs_f32(Dtype::F16, 256);
+        assert!(
+            f16_bytes < f32_bytes,
+            "f16 bytes {f16_bytes} !< f32 {f32_bytes}"
+        );
+        // f16 is near-lossless; recall should essentially match the f32 path.
+        assert!(recall >= 0.78, "f16 recall too low: {recall:.3}");
+    }
+
+    #[test]
+    fn hybrid_on_i8_store_keeps_recall_and_cuts_bytes() {
+        let (f32_bytes, i8_bytes, recall) = narrow_vs_f32(Dtype::I8, 256);
+        assert!(i8_bytes < f32_bytes, "i8 bytes {i8_bytes} !< f32 {f32_bytes}");
+        // i8 is lossier than f16 but still retains strong recall on this data.
+        assert!(recall >= 0.65, "i8 recall too low: {recall:.3}");
     }
 
     #[test]

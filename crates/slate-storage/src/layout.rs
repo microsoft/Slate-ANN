@@ -47,7 +47,7 @@ impl BlockLayout {
                 "block_size {block_size} must be a power of two"
             )));
         }
-        let vector_bytes = dtype.vector_bytes(dimensions);
+        let vector_bytes = dtype.stored_vector_bytes(dimensions);
         if vector_bytes == 0 {
             return Err(Error::invalid_config("vector_bytes computed as zero"));
         }
@@ -183,18 +183,14 @@ impl StoreWriter<BufWriter<File>> {
 }
 
 impl<W: Write> StoreWriter<W> {
-    /// Append one `f32` vector. Its dense index is returned.
+    /// Append one vector, encoding it into the layout's dtype. Its dense index
+    /// is returned. The caller always supplies `f32`; `f16`/`i8` layouts narrow
+    /// it on the way to disk.
     ///
     /// # Errors
     /// Returns [`Error::DimensionMismatch`] if the vector length differs from
-    /// the layout's dimensionality, [`Error::Unsupported`] if the layout dtype
-    /// is not `f32`, or [`Error::Io`] on write failure.
+    /// the layout's dimensionality, or [`Error::Io`] on write failure.
     pub fn push(&mut self, vector: &[f32]) -> Result<usize> {
-        if self.layout.dtype != Dtype::F32 {
-            return Err(Error::unsupported(
-                "StoreWriter currently supports only f32 vectors (Phase 2)",
-            ));
-        }
         if vector.len() != self.layout.dimensions {
             return Err(Error::DimensionMismatch {
                 expected: self.layout.dimensions,
@@ -210,10 +206,38 @@ impl<W: Write> StoreWriter<W> {
             self.block_cursor = 0;
         }
 
-        // bytemuck gives a zero-copy little-endian view on LE targets.
-        let bytes: &[u8] = bytemuck::cast_slice(vector);
-        self.writer.write_all(bytes)?;
-        self.block_cursor += bytes.len();
+        // Encode into the on-disk dtype. The BufWriter coalesces the small
+        // element-wise writes used by the narrow paths.
+        match self.layout.dtype {
+            Dtype::F32 => {
+                // bytemuck gives a zero-copy little-endian view on LE targets.
+                let bytes: &[u8] = bytemuck::cast_slice(vector);
+                self.writer.write_all(bytes)?;
+            }
+            Dtype::F16 => {
+                for x in vector {
+                    self.writer
+                        .write_all(&half::f16::from_f32(*x).to_le_bytes())?;
+                }
+            }
+            Dtype::I8 => {
+                let max_abs = vector.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                let scale = if max_abs == 0.0 { 0.0 } else { max_abs / 127.0 };
+                self.writer.write_all(&scale.to_le_bytes())?;
+                if scale == 0.0 {
+                    for _ in vector {
+                        self.writer.write_all(&[0u8])?;
+                    }
+                } else {
+                    let inv = 1.0 / scale;
+                    for x in vector {
+                        let q = (x * inv).round().clamp(-127.0, 127.0) as i8;
+                        self.writer.write_all(&[q as u8])?;
+                    }
+                }
+            }
+        }
+        self.block_cursor += self.layout.vector_bytes;
         let index = self.count;
         self.count += 1;
         Ok(index)

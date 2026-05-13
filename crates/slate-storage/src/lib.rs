@@ -21,12 +21,14 @@
 //! [`io::PreadBackend`] for explicit large positioned reads suited to HDDs.
 //! Access-pattern [`mmap::Advice`] hints expose the `madvise` knob.
 //!
-//! Phase 2 implements the f32 path. The HDD elevator I/O scheduler
-//! ([`schedule::FetchSchedule`]) lands in Phase 7; f16/i8 codecs follow.
+//! The HDD elevator I/O scheduler ([`schedule::FetchSchedule`]) and the narrow
+//! dtype codecs ([`codec`], f16/i8) land in Phase 7; narrow stores are decoded
+//! to `f32` on the read path so the rest of the engine stays dtype-blind.
 
 #![doc(html_root_url = "https://docs.rs/slate-storage")]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod codec;
 pub mod format;
 pub mod io;
 pub mod layout;

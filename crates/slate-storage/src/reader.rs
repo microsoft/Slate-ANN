@@ -130,30 +130,30 @@ impl<B: IoBackend> VectorStore<B> {
         &self.backend
     }
 
-    /// Fetch the `f32` vector at dense `index` into a freshly allocated `Vec`.
+    /// Fetch the vector at dense `index` into a freshly allocated `f32` `Vec`.
+    ///
+    /// Narrow stores are decoded to `f32`.
     ///
     /// # Errors
-    /// Returns [`Error::NotFound`] if `index >= len`, [`Error::Unsupported`]
-    /// if the store dtype is not `f32`, or an I/O error from the backend.
+    /// Returns [`Error::NotFound`] if `index >= len`, or an I/O error from the
+    /// backend.
     pub fn get(&self, index: usize) -> Result<Vec<f32>> {
         let mut out = vec![0.0f32; self.dimensions()];
         self.get_into(index, &mut out)?;
         Ok(out)
     }
 
-    /// Fetch the `f32` vector at dense `index` into a caller-provided buffer,
-    /// avoiding allocation on hot paths.
+    /// Fetch the vector at dense `index` into a caller-provided `f32` buffer,
+    /// avoiding allocation on the f32 hot path.
+    ///
+    /// Narrow stores (`f16`/`i8`) are decoded to `f32` here, so callers always
+    /// receive `f32` regardless of the on-disk dtype.
     ///
     /// # Errors
     /// Returns [`Error::NotFound`] if `index >= len`,
-    /// [`Error::DimensionMismatch`] if `out.len() != dimensions`,
-    /// [`Error::Unsupported`] if the dtype is not `f32`, or an I/O error.
+    /// [`Error::DimensionMismatch`] if `out.len() != dimensions`, or an I/O
+    /// error from the backend.
     pub fn get_into(&self, index: usize, out: &mut [f32]) -> Result<()> {
-        if self.header.dtype != Dtype::F32 {
-            return Err(Error::unsupported(
-                "VectorStore::get currently decodes only f32 (Phase 2)",
-            ));
-        }
         if index >= self.len() {
             return Err(Error::NotFound(VectorId::new(index as u64)));
         }
@@ -164,9 +164,24 @@ impl<B: IoBackend> VectorStore<B> {
             });
         }
         let offset = self.layout.vector_offset(index);
-        // bytemuck view of the output buffer as raw bytes; LE targets only.
-        let dst: &mut [u8] = bytemuck::cast_slice_mut(out);
-        self.backend.read_exact_at(offset, dst)?;
+        match self.header.dtype {
+            Dtype::F32 => {
+                // Zero-copy: read straight into the output buffer's bytes.
+                let dst: &mut [u8] = bytemuck::cast_slice_mut(out);
+                self.backend.read_exact_at(offset, dst)?;
+            }
+            Dtype::F16 => {
+                // Read the narrow slot, then widen to f32.
+                let mut buf = vec![0u8; self.layout.vector_bytes()];
+                self.backend.read_exact_at(offset, &mut buf)?;
+                crate::codec::decode_f16(&buf, out)?;
+            }
+            Dtype::I8 => {
+                let mut buf = vec![0u8; self.layout.vector_bytes()];
+                self.backend.read_exact_at(offset, &mut buf)?;
+                crate::codec::decode_i8(&buf, out)?;
+            }
+        }
         Ok(())
     }
 
@@ -275,6 +290,101 @@ mod tests {
         for i in (0..500).step_by(37) {
             assert_eq!(store.get(i).unwrap(), expected(i, dims));
         }
+    }
+
+    /// Write `count` deterministic vectors with a chosen dtype.
+    fn write_store_dtype(
+        dtype: Dtype,
+        dims: usize,
+        block_size: usize,
+        count: usize,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("narrow.bin");
+        let layout = BlockLayout::new(dtype, dims, block_size).unwrap();
+        let mut w = StoreWriter::create(&path, layout).unwrap();
+        for i in 0..count {
+            // Bounded payload in [-1, 1] so i8/f16 error stays small & checkable.
+            let v: Vec<f32> = (0..dims)
+                .map(|d| (((i * 7 + d * 13) % 200) as f32 / 100.0) - 1.0)
+                .collect();
+            w.push(&v).unwrap();
+        }
+        let header = w.finish().unwrap();
+        assert_eq!(header.count, count as u64);
+        assert_eq!(header.dtype, dtype);
+        (dir, path)
+    }
+
+    fn bounded(i: usize, dims: usize) -> Vec<f32> {
+        (0..dims)
+            .map(|d| (((i * 7 + d * 13) % 200) as f32 / 100.0) - 1.0)
+            .collect()
+    }
+
+    #[test]
+    fn f16_store_round_trips_within_tolerance() {
+        let dims = 16;
+        let count = 200;
+        let (_dir, path) = write_store_dtype(Dtype::F16, dims, 1024, count);
+        let store = VectorStore::open_mmap(&path).unwrap();
+        assert_eq!(store.dtype(), Dtype::F16);
+        // f16 footprint is half of f32 (no per-vector metadata).
+        assert_eq!(store.layout().vector_bytes(), dims * 2);
+        for i in 0..count {
+            let got = store.get(i).unwrap();
+            let want = bounded(i, dims);
+            for (a, b) in want.iter().zip(got.iter()) {
+                assert!((a - b).abs() <= 1e-2, "f16 vec {i}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn i8_store_round_trips_within_tolerance_and_matches_on_both_backends() {
+        let dims = 12;
+        let count = 137;
+        let (_dir, path) = write_store_dtype(Dtype::I8, dims, 512, count);
+        let mmap = VectorStore::open_mmap(&path).unwrap();
+        let pread = VectorStore::open_pread(&path).unwrap();
+        assert_eq!(mmap.dtype(), Dtype::I8);
+        // i8 footprint is dims code bytes + a 4-byte scale.
+        assert_eq!(mmap.layout().vector_bytes(), dims + 4);
+        for i in 0..count {
+            let m = mmap.get(i).unwrap();
+            let p = pread.get(i).unwrap();
+            assert_eq!(m, p, "backends disagree on i8 vec {i}");
+            let want = bounded(i, dims);
+            // Symmetric per-vector quant: error <= half a step = max_abs/254.
+            let max_abs = want.iter().fold(0.0f32, |mx, x| mx.max(x.abs()));
+            let tol = max_abs / 254.0 + 1e-6;
+            for (a, b) in want.iter().zip(m.iter()) {
+                assert!((a - b).abs() <= tol, "i8 vec {i}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_dtypes_shrink_the_file() {
+        let dims = 64;
+        let count = 300;
+        let block = 4096;
+        let f32_len = {
+            let (_d, p) = write_store(dims, block, count);
+            std::fs::metadata(&p).unwrap().len()
+        };
+        let f16_len = {
+            let (_d, p) = write_store_dtype(Dtype::F16, dims, block, count);
+            std::fs::metadata(&p).unwrap().len()
+        };
+        let i8_len = {
+            let (_d, p) = write_store_dtype(Dtype::I8, dims, block, count);
+            std::fs::metadata(&p).unwrap().len()
+        };
+        // f16 strictly smaller than f32; i8 strictly smaller than f16 (the
+        // +4B scale is dwarfed by dims=64).
+        assert!(f16_len < f32_len, "f16 {f16_len} !< f32 {f32_len}");
+        assert!(i8_len < f16_len, "i8 {i8_len} !< f16 {f16_len}");
     }
 }
 

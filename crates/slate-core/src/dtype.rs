@@ -39,10 +39,34 @@ impl Dtype {
     /// Byte length of a `dimensions`-long vector stored in this dtype.
     ///
     /// Note: `I8` vectors additionally carry a small per-vector scale factor in
-    /// the storage layer; this returns only the element payload size.
+    /// the storage layer; this returns only the element payload size. Use
+    /// [`stored_vector_bytes`](Self::stored_vector_bytes) for the full on-disk
+    /// footprint including that metadata.
     #[inline]
     pub const fn vector_bytes(self, dimensions: usize) -> usize {
         self.size_bytes() * dimensions
+    }
+
+    /// Per-vector metadata bytes the storage layer prepends to each vector slot.
+    ///
+    /// `I8` stores a single `f32` scale factor inline at the start of every
+    /// vector; `F32` and `F16` carry no per-vector metadata.
+    #[inline]
+    pub const fn metadata_bytes(self) -> usize {
+        match self {
+            Dtype::I8 => core::mem::size_of::<f32>(),
+            Dtype::F32 | Dtype::F16 => 0,
+        }
+    }
+
+    /// Full on-disk footprint of one `dimensions`-long vector slot: the element
+    /// payload plus any per-vector metadata (the `I8` scale factor).
+    ///
+    /// This is the stride the block geometry uses, and the number of bytes a
+    /// single-vector read actually moves off the store.
+    #[inline]
+    pub const fn stored_vector_bytes(self, dimensions: usize) -> usize {
+        self.vector_bytes(dimensions) + self.metadata_bytes()
     }
 
     /// Whether this dtype is lossy relative to the caller's `f32` input.
@@ -78,6 +102,27 @@ mod tests {
         assert_eq!(Dtype::F32.vector_bytes(768), 768 * 4);
         assert_eq!(Dtype::F16.vector_bytes(768), 768 * 2);
         assert_eq!(Dtype::I8.vector_bytes(768), 768);
+    }
+
+    #[test]
+    fn metadata_and_stored_footprint() {
+        // Only I8 carries per-vector metadata (a single f32 scale).
+        assert_eq!(Dtype::F32.metadata_bytes(), 0);
+        assert_eq!(Dtype::F16.metadata_bytes(), 0);
+        assert_eq!(Dtype::I8.metadata_bytes(), 4);
+
+        // Stored footprint = payload + metadata.
+        assert_eq!(Dtype::F32.stored_vector_bytes(768), 768 * 4);
+        assert_eq!(Dtype::F16.stored_vector_bytes(768), 768 * 2);
+        assert_eq!(Dtype::I8.stored_vector_bytes(768), 768 + 4);
+
+        // Narrowing is strictly monotone in footprint even at small dims where
+        // the I8 scale is most visible.
+        let d = 16;
+        assert!(
+            Dtype::I8.stored_vector_bytes(d) < Dtype::F16.stored_vector_bytes(d)
+                && Dtype::F16.stored_vector_bytes(d) < Dtype::F32.stored_vector_bytes(d)
+        );
     }
 
     #[test]

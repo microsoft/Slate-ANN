@@ -79,10 +79,11 @@ pub struct FileHeader {
 }
 
 impl FileHeader {
-    /// Bytes occupied by a single vector of this header's dtype/dims.
+    /// Full on-disk footprint of a single vector slot for this header's
+    /// dtype/dims, including any per-vector metadata (the `I8` scale factor).
     #[must_use]
     pub fn vector_bytes(&self) -> usize {
-        self.dtype.vector_bytes(self.dimensions as usize)
+        self.dtype.stored_vector_bytes(self.dimensions as usize)
     }
 
     /// Serialize the header into a fixed `HEADER_SIZE` buffer (zero-padded).
@@ -213,6 +214,29 @@ mod tests {
         let h = sample();
         let bytes = h.to_bytes();
         let parsed = FileHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(h, parsed);
+    }
+
+    #[test]
+    fn i8_header_footprint_includes_scale_and_validates() {
+        // i8 slot footprint is dims code bytes + a 4-byte per-vector scale.
+        let dtype = Dtype::I8;
+        let dimensions = 100u32;
+        let block_size = 4096u32;
+        let vbytes = dtype.stored_vector_bytes(dimensions as usize);
+        assert_eq!(vbytes, 100 + 4);
+        let vectors_per_block = (block_size as usize / vbytes) as u32;
+        let h = FileHeader {
+            dtype,
+            dimensions,
+            count: 50,
+            block_size,
+            vectors_per_block,
+        };
+        // vector_bytes() must report the stored footprint, and the header must
+        // round-trip and validate with that vectors_per_block.
+        assert_eq!(h.vector_bytes(), 104);
+        let parsed = FileHeader::from_bytes(&h.to_bytes()).unwrap();
         assert_eq!(h, parsed);
     }
 
