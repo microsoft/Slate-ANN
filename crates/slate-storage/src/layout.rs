@@ -132,6 +132,23 @@ impl BlockLayout {
         self.block_offset(self.block_of(i)) + self.slot_of(i) * self.vector_bytes
     }
 
+    /// Byte span `(offset, len)` covering the contiguous run of dense indices
+    /// `first..=last` inclusive (`first <= last`).
+    ///
+    /// Because [`Self::vector_offset`] is monotonic in the dense index, the run
+    /// occupies one contiguous range from the start of `first` to the end of
+    /// `last`. The span may include block-boundary padding between the two if
+    /// they straddle adjacent blocks; it is still a single sequential range the
+    /// disk head streams without re-seeking. The elevator scheduler reads one
+    /// such span per coalesced run.
+    #[must_use]
+    pub fn run_span(&self, first: usize, last: usize) -> (usize, usize) {
+        debug_assert!(first <= last, "run_span requires first <= last");
+        let start = self.vector_offset(first);
+        let end = self.vector_offset(last) + self.vector_bytes;
+        (start, end - start)
+    }
+
     /// Build the matching [`FileHeader`] for `count` vectors.
     #[must_use]
     pub fn header(&self, count: u64) -> FileHeader {

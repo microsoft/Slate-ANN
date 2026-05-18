@@ -966,26 +966,6 @@ impl HnswIndex {
         slate_simd::distance(self.metric, query, scratch)
     }
 
-    /// Exact distance to node `b` as part of a scheduler-planned batch: streams
-    /// the vector and counts the visit and the exact distance, but does **not**
-    /// charge the read. The batch's reads are charged once by the caller from
-    /// the coalesced [`slate_storage::FetchSchedule`], so summing per-vector
-    /// reads here would double-count and erase the seek-coalescing win.
-    #[inline]
-    fn dist_fetched<B: IoBackend>(
-        &self,
-        store: &VectorStore<B>,
-        query: &[f32],
-        b: u32,
-        scratch: &mut [f32],
-        counters: &mut QueryCounters,
-    ) -> Result<f32> {
-        store.get_into(b as usize, scratch)?;
-        counters.visit_node();
-        counters.add_exact(1);
-        slate_simd::distance(self.metric, query, scratch)
-    }
-
     /// Layer-0 best-first search reading exact vectors from the store.
     #[allow(clippy::too_many_arguments)]
     fn search_layer_disk<B: IoBackend>(
@@ -1224,12 +1204,18 @@ impl HnswIndex {
                     let indices: Vec<usize> = batch.iter().map(|&n| n as usize).collect();
                     let plan = slate_storage::FetchSchedule::plan(store.layout(), &indices);
 
-                    // Read in seek order; `dist_fetched` counts the visit and
-                    // the exact distance but not the read — the batch's reads
+                    // Execute the plan with one positioned read per coalesced
+                    // run (not one per vector): `fetch_scheduled` streams each
+                    // contiguous run off the platter once and hands back each
+                    // decoded vector in seek order. The closure counts the visit
+                    // and the exact distance but not the read — the batch's reads
                     // are charged once below from the coalesced plan.
-                    for &idx in plan.order() {
+                    let metric = self.metric;
+                    store.fetch_scheduled(&plan, scratch, |idx, vec| {
                         let node = idx as u32;
-                        let exact = self.dist_fetched(store, query, node, scratch, counters)?;
+                        let exact = slate_simd::distance(metric, query, vec)?;
+                        counters.visit_node();
+                        counters.add_exact(1);
                         exact_known[node as usize] = true;
                         exact_frontier.push(Candidate { node, score: exact });
                         results.push(ResultEntry { node, score: exact });
@@ -1237,7 +1223,8 @@ impl HnswIndex {
                             results.pop();
                         }
                         fetched_this_round += 1;
-                    }
+                        Ok(())
+                    })?;
 
                     // One coalesced storage charge for the whole batch: the same
                     // payload bytes, but only `plan.seeks()` head positionings.
@@ -2193,6 +2180,123 @@ mod tests {
             mean_recall >= 0.85,
             "mean recall@{k} under pruning was {mean_recall}, expected >= 0.85"
         );
+    }
+
+    /// An [`IoBackend`] that wraps another backend and tallies every
+    /// `read_exact_at` call, so a test can observe the real syscall count the
+    /// coalesced fetch path issues (as opposed to the cost-model `seeks`).
+    struct CountingBackend<B: IoBackend> {
+        inner: B,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl<B: IoBackend> CountingBackend<B> {
+        fn new(inner: B) -> Self {
+            Self {
+                inner,
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl<B: IoBackend> IoBackend for CountingBackend<B> {
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn read_exact_at(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.read_exact_at(offset, buf)
+        }
+
+        fn advise_range(
+            &self,
+            offset: usize,
+            len: usize,
+            advice: slate_storage::Advice,
+        ) -> Result<()> {
+            self.inner.advise_range(offset, len, advice)
+        }
+    }
+
+    #[test]
+    fn hybrid_fetch_issues_one_read_per_run_not_per_vector() {
+        // The scheduler plans contiguous runs; the coalesced fetch path must
+        // issue exactly one backend read per run. On a small-block store where
+        // fetched vectors share/neighbour blocks, that means strictly fewer
+        // reads than vectors fetched — the real-syscall payoff of the modeled
+        // seek coalescing, with recall and byte accounting untouched.
+        let mut rng = SplitMix64::new(2025);
+        let dims = 16;
+        let n = 400;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dims).map(|_| rng.next_f64() as f32).collect())
+            .collect();
+        // block_size 256, dims-16 f32 => 64 B/vec => 4 vectors/block.
+        let (tmp, build_store_handle) = build_store_blocked(&vectors, dims, 256);
+        let params = HnswParams {
+            m: 16,
+            m_max: 32,
+            ef_construction: 200,
+            ..HnswParams::default()
+        };
+        let index =
+            HnswIndex::build_with_pq(&build_store_handle, Metric::L2, &params, &hybrid_pq(), 555)
+                .unwrap();
+
+        // Re-open the same file behind a read-counting backend.
+        let counting = VectorStore::with_backend(
+            CountingBackend::new(slate_storage::MmapBackend::open(tmp.path()).unwrap()),
+        )
+        .unwrap();
+
+        let k = 10;
+        let cfg = SearchConfig {
+            k,
+            ef_search: 64,
+            ..SearchConfig::default()
+        };
+
+        let queries = 30;
+        let mut total_reads = 0usize;
+        let mut total_fetched = 0u64;
+        let mut total_runs = 0u64;
+        let mut total_recall = 0.0f64;
+        for _ in 0..queries {
+            let before = counting.backend().reads();
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+            let (res, stats) = index.search_hybrid(&counting, &query, &cfg).unwrap();
+            let reads = counting.backend().reads() - before;
+            // The fetch path issues exactly one read per planned run, and the
+            // scheduler reports those runs as `seeks`.
+            assert_eq!(
+                reads as u64, stats.counters.seeks,
+                "backend reads {reads} must equal planned runs/seeks {}",
+                stats.counters.seeks
+            );
+            // Runs never exceed the vectors fetched.
+            assert!(stats.counters.seeks <= stats.counters.exact_distances);
+            total_reads += reads;
+            total_fetched += stats.counters.exact_distances;
+            total_runs += stats.counters.seeks;
+            let truth = naive_knn(&vectors, &query, Metric::L2, k);
+            let hits = res.iter().filter(|nb| truth.contains(&nb.id.get())).count();
+            total_recall += hits as f64 / k as f64;
+        }
+        // Across the workload, coalescing must have fired: strictly fewer real
+        // reads than vectors fetched.
+        assert!(
+            total_reads < total_fetched as usize,
+            "expected coalescing: total reads {total_reads} !< vectors fetched {total_fetched}"
+        );
+        assert_eq!(total_reads as u64, total_runs);
+        let mean_recall = total_recall / f64::from(queries);
+        assert!(mean_recall >= 0.80, "recall regressed: {mean_recall:.3}");
     }
 }
 

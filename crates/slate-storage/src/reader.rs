@@ -185,6 +185,86 @@ impl<B: IoBackend> VectorStore<B> {
         Ok(())
     }
 
+    /// Decode one vector slot out of an in-memory byte buffer holding the
+    /// dtype's on-disk bytes (`vector_bytes()` long) into an `f32` output.
+    ///
+    /// Shared by [`Self::get_into`]'s narrow paths and the run-coalesced
+    /// [`Self::fetch_scheduled`] executor.
+    ///
+    /// # Errors
+    /// Propagates codec [`Error::DimensionMismatch`] if the buffer length is
+    /// wrong for the dtype.
+    fn decode_slot(dtype: Dtype, slot: &[u8], out: &mut [f32]) -> Result<()> {
+        match dtype {
+            Dtype::F32 => {
+                let src: &[f32] = bytemuck::cast_slice(slot);
+                out.copy_from_slice(src);
+            }
+            Dtype::F16 => crate::codec::decode_f16(slot, out)?,
+            Dtype::I8 => crate::codec::decode_i8(slot, out)?,
+        }
+        Ok(())
+    }
+
+    /// Execute a [`FetchSchedule`] with one positioned read per coalesced run,
+    /// decoding each requested vector to `f32`.
+    ///
+    /// This is the elevator scheduler's *executor*: where [`Self::get_into`]
+    /// issues one backend read per vector, `fetch_scheduled` issues one read per
+    /// run span (`plan.run_spans(layout).len()` reads, i.e. `plan.runs()`),
+    /// streaming each contiguous run off the platter in a single positioned read
+    /// and slicing the vectors out of the run buffer. With graph-aware layout
+    /// the runs are long, so a query's read-syscall count collapses from
+    /// `order.len()` to `runs`.
+    ///
+    /// For each vector in `plan.order()`, in order, `visit` is called with the
+    /// dense index and its decoded `f32` slot. The caller does its own distance
+    /// work and counter accounting (the storage counters are charged once for
+    /// the whole batch by the caller, using `plan.bytes()/seeks()/runs()`).
+    ///
+    /// # Errors
+    /// Returns [`Error::DimensionMismatch`] if `scratch.len() != dimensions`, or
+    /// an I/O error from the backend.
+    pub fn fetch_scheduled<F>(
+        &self,
+        plan: &crate::schedule::FetchSchedule,
+        scratch: &mut [f32],
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, &[f32]) -> Result<()>,
+    {
+        if scratch.len() != self.dimensions() {
+            return Err(Error::DimensionMismatch {
+                expected: self.dimensions(),
+                got: scratch.len(),
+            });
+        }
+        let order = plan.order();
+        let vbytes = self.layout.vector_bytes();
+        let mut run_buf: Vec<u8> = Vec::new();
+        for (start, count) in plan.run_spans(&self.layout) {
+            let first = order[start];
+            let last = order[start + count - 1];
+            let (offset, len) = self.layout.run_span(first, last);
+            // Pre-fault the run the elevator is about to stream; the map is
+            // otherwise left `Random` (set by the caller before traversal).
+            let _ = self
+                .backend
+                .advise_range(offset, len, Advice::WillNeed);
+            run_buf.resize(len, 0);
+            self.backend.read_exact_at(offset, &mut run_buf)?;
+            // Slice each vector out of the run buffer at its span-relative byte
+            // offset and decode into `scratch`.
+            for &index in &order[start..start + count] {
+                let rel = self.layout.vector_offset(index) - offset;
+                Self::decode_slot(self.header.dtype, &run_buf[rel..rel + vbytes], scratch)?;
+                visit(index, scratch)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Convenience: fetch by [`VectorId`], treating its value as dense index.
     ///
     /// # Errors

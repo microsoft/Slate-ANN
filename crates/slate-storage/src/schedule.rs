@@ -117,6 +117,35 @@ impl FetchSchedule {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    /// Group [`Self::order`] into coalesced runs, each returned as a
+    /// `(start, count)` window into `order`: the run covers
+    /// `order[start..start + count]`, a stretch of indices whose blocks are
+    /// equal or adjacent and therefore form one contiguous byte span.
+    ///
+    /// The number of windows equals [`Self::runs`] (and [`Self::seeks`]): each
+    /// window is exactly one head positioning. The elevator executor issues one
+    /// positioned read per window.
+    #[must_use]
+    pub fn run_spans(&self, layout: &BlockLayout) -> Vec<(usize, usize)> {
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut prev_block: Option<usize> = None;
+        for (pos, &i) in self.order.iter().enumerate() {
+            let block = layout.block_of(i);
+            let continues = matches!(prev_block, Some(pb) if block == pb || block == pb + 1);
+            if continues {
+                // Extend the current (last) run.
+                if let Some(last) = spans.last_mut() {
+                    last.1 += 1;
+                }
+            } else {
+                // Start a new run at this position.
+                spans.push((pos, 1));
+            }
+            prev_block = Some(block);
+        }
+        spans
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +230,41 @@ mod tests {
         assert_eq!(plan.order(), sorted.as_slice());
     }
 
+    #[test]
+    fn run_spans_match_run_count_and_cover_order() {
+        let layout = one_per_block();
+        // Blocks {0,1, 5, 9,10}: runs {0,1}, {5}, {9,10}.
+        let plan = FetchSchedule::plan(&layout, &[10, 0, 9, 1, 5]);
+        let spans = plan.run_spans(&layout);
+        assert_eq!(spans.len() as u64, plan.runs());
+        assert_eq!(spans, vec![(0, 2), (2, 1), (3, 2)]);
+        // Spans partition order positions [0, order.len()) contiguously.
+        let mut next = 0;
+        let mut covered = 0;
+        for (start, count) in spans {
+            assert_eq!(start, next);
+            next += count;
+            covered += count;
+        }
+        assert_eq!(covered, plan.order().len());
+    }
+
+    #[test]
+    fn run_span_byte_range_is_contiguous_and_monotonic() {
+        let layout = one_per_block();
+        // Adjacent blocks 5,6,7 form one run spanning three slots.
+        let plan = FetchSchedule::plan(&layout, &[7, 5, 6]);
+        let spans = plan.run_spans(&layout);
+        assert_eq!(spans, vec![(0, 3)]);
+        let (start_pos, count) = spans[0];
+        let first = plan.order()[start_pos];
+        let last = plan.order()[start_pos + count - 1];
+        let (offset, len) = layout.run_span(first, last);
+        assert_eq!(offset, layout.vector_offset(5));
+        // 3 one-vector blocks => span covers 3 whole blocks worth of bytes.
+        assert_eq!(len, layout.vector_offset(7) + layout.vector_bytes() as usize - layout.vector_offset(5));
+    }
+
     proptest::proptest! {
         #[test]
         fn invariants_hold(
@@ -239,6 +303,18 @@ mod tests {
             } else {
                 proptest::prop_assert!(plan.seeks() >= 1);
             }
+
+            // run_spans partitions the order into exactly `runs` contiguous
+            // windows.
+            let spans = plan.run_spans(&layout);
+            proptest::prop_assert_eq!(spans.len() as u64, plan.runs());
+            let mut next = 0usize;
+            for (start, count) in &spans {
+                proptest::prop_assert_eq!(*start, next);
+                proptest::prop_assert!(*count >= 1);
+                next += count;
+            }
+            proptest::prop_assert_eq!(next, order.len());
         }
     }
 }
