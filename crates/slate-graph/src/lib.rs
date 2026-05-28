@@ -12,18 +12,23 @@
 //!
 //! ## Status
 //!
-//! Phase 4 populates the **HNSW** backend with a plain in-RAM proximity graph
-//! that ranks with **exact** distances streamed from a
-//! [`slate_storage::VectorStore`]. It accumulates a
-//! [`slate_core::QueryCounters`] per search so the storage-aware cost model can
-//! price the traversal. LEANN high-degree-preserving pruning (Phase 6), the PQ
-//! approximate tier and two-level hybrid search (Phase 5), the IVF backend
-//! (Phase 8), and on-disk graph persistence all land in later phases.
+//! The **HNSW** backend (Phases 4–7) is a proximity graph with LEANN
+//! high-degree-preserving pruning that ranks with **exact** distances streamed
+//! from a [`slate_storage::VectorStore`], optionally gated by a PQ approximate
+//! tier (two-level hybrid search), and fetches candidates in coalesced seek
+//! order via the Phase-7 [`slate_storage::FetchSchedule`]. The **IVF** backend
+//! (Phase 8) adds a k-means coarse quantizer with soft-assigned posting lists,
+//! reusing the same storage-aware fetch path to stream a probe's candidates in
+//! seek order. Both accumulate a [`slate_core::QueryCounters`] per search so the
+//! storage-aware cost model can price the work. On-disk index persistence lands
+//! in Phase 9.
 
 #![doc(html_root_url = "https://docs.rs/slate-graph")]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod hnsw;
+pub mod ivf;
 pub mod rng;
 
 pub use hnsw::{HnswIndex, HnswStats};
+pub use ivf::{IvfIndex, IvfStats};
