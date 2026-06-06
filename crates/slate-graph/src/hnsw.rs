@@ -100,6 +100,18 @@ const PQ_TRAIN_ITERS: usize = 25;
 /// while staying a deterministic function of it.
 const PQ_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// k-means iterations used to train the coarse shard quantizer in
+/// [`HnswIndex::build_sharded`].
+const SHARD_KMEANS_ITERS: usize = 25;
+
+/// Mixing constant for the shard quantizer's k-means seed (decorrelated from the
+/// graph and PQ seeds, still a deterministic function of the build seed).
+const SHARD_SEED_MIX: u64 = 0x2545_F491_4F6C_DD1D;
+
+/// Stride applied to the build seed when deriving a distinct per-shard seed, so
+/// each shard's subgraph builds with a decorrelated yet deterministic order.
+const SHARD_SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// Parameters controlling graph shape, mirroring [`slate_core::HnswParams`] but
 /// resolved into the fields the builder uses directly.
 #[derive(Debug, Clone, Copy)]
@@ -266,6 +278,205 @@ impl HnswIndex {
         Self::build_inner(store, metric, params, Some(pq), seed)
     }
 
+    /// Storage-efficient **sharded build** (LEANN Section 6).
+    ///
+    /// Builds an HNSW graph over every vector in `store` without ever holding
+    /// the whole corpus resident for the graph-construction phase. A k-means
+    /// coarse quantizer with `num_shards` centroids partitions the corpus into
+    /// overlapping shards (each vector soft-assigned to its `soft_assign` nearest
+    /// centroids); each shard's subgraph is built over a buffer sized to that
+    /// shard alone, streamed from `store` and dropped before the next shard; the
+    /// subgraphs are then merged into one global graph. Peak resident vector
+    /// memory during construction is therefore one shard, not `O(N)`.
+    ///
+    /// The merged graph is searchable by [`HnswIndex::search`] exactly like a
+    /// monolithic build (it has no PQ tier — use [`HnswIndex::build_with_pq`] for
+    /// the hybrid path). Because shards build in independent orders, the merged
+    /// graph is a *different but comparable* graph, not bit-identical to
+    /// [`HnswIndex::build`].
+    ///
+    /// `num_shards <= 1` (or `num_shards >= store.len()`) collapses to the
+    /// single-shot [`HnswIndex::build`]. `soft_assign` is clamped to
+    /// `1..=num_shards`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store's dtype is unsupported (non-`F32`), a vector
+    /// read fails, or k-means training fails.
+    pub fn build_sharded<B: IoBackend>(
+        store: &VectorStore<B>,
+        metric: Metric,
+        params: &slate_core::HnswParams,
+        num_shards: usize,
+        soft_assign: usize,
+        seed: u64,
+    ) -> Result<Self> {
+        let dims = store.dimensions();
+        let len = store.len();
+        let gp = GraphParams::from_config(params);
+
+        // Degenerate cases fall back to the single-shot build, which is already
+        // correct and (for tiny corpora) cheaper than sharding overhead.
+        if len == 0 {
+            return Self::build_resident(Vec::new(), dims, 0, metric, gp, None, Vec::new(), seed);
+        }
+        if num_shards <= 1 || num_shards >= len {
+            return Self::build(store, metric, params, seed);
+        }
+
+        // --- Coarse quantizer ---------------------------------------------
+        // Train `num_shards` centroids over the corpus. This is the only step
+        // that touches every vector at once; the expensive O(N·ef·M) graph
+        // construction below is what gets bounded to one shard. The training
+        // buffer lives in its own scope and is dropped before any subgraph is
+        // built, so it never coexists with shard build memory.
+        let centroids = {
+            let mut data = vec![0.0f32; len.saturating_mul(dims)];
+            for i in 0..len {
+                let start = i * dims;
+                store.get_into(i, &mut data[start..start + dims])?;
+            }
+            let km = slate_pq::kmeans::train(
+                &data,
+                dims,
+                num_shards,
+                SHARD_KMEANS_ITERS,
+                seed ^ SHARD_SEED_MIX,
+            )?;
+            km.centroids
+        };
+        let shard_count = centroids.len() / dims;
+        if shard_count <= 1 {
+            // k-means collapsed (e.g. many duplicate points) — nothing to gain.
+            return Self::build(store, metric, params, seed);
+        }
+        let soft = soft_assign.clamp(1, shard_count);
+
+        // --- Soft assignment ----------------------------------------------
+        // Stream each vector once, assign it to its `soft` nearest centroids.
+        // `shard_members[s]` is the ascending list of global ids in shard `s`.
+        let mut shard_members: Vec<Vec<u32>> = vec![Vec::new(); shard_count];
+        {
+            let mut scratch = vec![0.0f32; dims];
+            for i in 0..len {
+                store.get_into(i, &mut scratch)?;
+                let nearest = nearest_centroids(&centroids, shard_count, dims, &scratch, soft)?;
+                for s in nearest {
+                    shard_members[s].push(i as u32);
+                }
+            }
+        }
+
+        // --- Per-shard subgraph build + merge -----------------------------
+        // `merged[layer][global]` accumulates the union of out-edges that global
+        // node earned across the shards it appeared in. `node_levels` keeps the
+        // highest level any shard assigned to each node.
+        let mut merged: Vec<Vec<Vec<u32>>> = vec![vec![Vec::new(); len]];
+        let mut node_levels = vec![0u8; len];
+
+        for (s, members) in shard_members.iter().enumerate() {
+            if members.is_empty() {
+                continue;
+            }
+            let shard_len = members.len();
+
+            // Stream this shard's vectors into a shard-local buffer. `members[l]`
+            // is the global id of shard-local node `l`.
+            let mut shard_data = vec![0.0f32; shard_len * dims];
+            for (l, &g) in members.iter().enumerate() {
+                let start = l * dims;
+                store.get_into(g as usize, &mut shard_data[start..start + dims])?;
+            }
+
+            // Build the subgraph. A per-shard seed keeps the whole build
+            // deterministic yet decorrelates shard insertion orders.
+            let shard_seed = seed
+                .wrapping_mul(SHARD_SEED_STRIDE)
+                .wrapping_add(s as u64);
+            let sub = Self::build_resident(
+                shard_data,
+                dims,
+                shard_len,
+                metric,
+                gp,
+                None,
+                Vec::new(),
+                shard_seed,
+            )?;
+
+            // Lift every subgraph layer into the merged graph, remapping
+            // shard-local ids to global ids. Grow `merged` if this shard reached
+            // higher than any previous one.
+            if sub.max_layer >= merged.len() {
+                merged.resize(sub.max_layer + 1, vec![Vec::new(); len]);
+            }
+            for (layer, layer_adj) in sub.adjacency.iter().enumerate() {
+                for (l, neighbors) in layer_adj.iter().enumerate() {
+                    let g = members[l] as usize;
+                    let dst = &mut merged[layer][g];
+                    for &w in neighbors {
+                        dst.push(members[w as usize]);
+                    }
+                }
+            }
+            for (l, &lvl) in sub.node_levels.iter().enumerate() {
+                let g = members[l] as usize;
+                if lvl > node_levels[g] {
+                    node_levels[g] = lvl;
+                }
+            }
+        }
+
+        // --- Cap merged out-degrees ---------------------------------------
+        // Each merged list is a union, so it can exceed the degree budget and
+        // contain duplicates. Deduplicate, then cap to the layer's budget
+        // (`m_max` on layer 0, `m` above), keeping the closest neighbours by
+        // exact distance — computed by streaming the few vectors involved, so
+        // the cap never re-materializes the corpus.
+        let max_layer = merged.len() - 1;
+        let mut vbuf_a = vec![0.0f32; dims];
+        let mut vbuf_b = vec![0.0f32; dims];
+        for (layer, layer_adj) in merged.iter_mut().enumerate() {
+            let cap = gp.cap_for_layer(layer);
+            for (node, neighbors) in layer_adj.iter_mut().enumerate() {
+                neighbors.sort_unstable();
+                neighbors.dedup();
+                if neighbors.len() <= cap {
+                    continue;
+                }
+                store.get_into(node, &mut vbuf_a)?;
+                let mut scored: Vec<Candidate> = Vec::with_capacity(neighbors.len());
+                for &w in neighbors.iter() {
+                    store.get_into(w as usize, &mut vbuf_b)?;
+                    let d = slate_simd::distance(metric, &vbuf_a, &vbuf_b)?;
+                    scored.push(Candidate { node: w, score: d });
+                }
+                *neighbors = select_neighbors(&scored, cap);
+            }
+        }
+
+        // The global entry point is the highest-level node (ties → smallest id),
+        // mirroring how a monolithic build's entry point sits at the top layer.
+        let entry_point = (0..len as u32).max_by(|&a, &b| {
+            node_levels[a as usize]
+                .cmp(&node_levels[b as usize])
+                .then(b.cmp(&a))
+        });
+
+        Ok(Self {
+            adjacency: merged,
+            node_levels,
+            entry_point,
+            max_layer,
+            len,
+            dims,
+            metric,
+            params: gp,
+            codebook: None,
+            codes: Vec::new(),
+        })
+    }
+
     /// Shared build path. When `pq` is `Some` and the store is non-empty, trains
     /// a PQ codebook on the resident vectors and encodes them all.
     fn build_inner<B: IoBackend>(
@@ -307,6 +518,24 @@ impl HnswIndex {
             _ => (None, Vec::new()),
         };
 
+        Self::build_resident(data, dims, len, metric, gp, codebook, codes, seed)
+    }
+
+    /// Build a graph from vectors already resident in RAM (`data`, row-major,
+    /// `len * dims`). Shared by [`HnswIndex::build_inner`] (whole corpus) and the
+    /// per-shard builder behind [`HnswIndex::build_sharded`] (one shard at a
+    /// time). Inserts every node, then runs the Phase-6 high-degree prune.
+    #[allow(clippy::too_many_arguments)]
+    fn build_resident(
+        data: Vec<f32>,
+        dims: usize,
+        len: usize,
+        metric: Metric,
+        params: GraphParams,
+        codebook: Option<slate_pq::PqCodebook>,
+        codes: Vec<u8>,
+        seed: u64,
+    ) -> Result<Self> {
         let mut index = Self {
             adjacency: vec![vec![Vec::new(); len]],
             node_levels: vec![0u8; len],
@@ -315,7 +544,7 @@ impl HnswIndex {
             len,
             dims,
             metric,
-            params: gp,
+            params,
             codebook,
             codes,
         };
@@ -1321,6 +1550,28 @@ fn select_neighbors(candidates: &[Candidate], cap: usize) -> Vec<u32> {
     sorted.into_iter().map(|c| c.node).collect()
 }
 
+/// Return the indices of the `count` centroids nearest to `v` (squared-L2),
+/// ascending by distance then id. Used by [`HnswIndex::build_sharded`] to
+/// soft-assign each vector to its nearest shards. (The IVF backend has its own
+/// copy for its own module; they are intentionally independent.)
+fn nearest_centroids(
+    centroids: &[f32],
+    num_lists: usize,
+    dims: usize,
+    v: &[f32],
+    count: usize,
+) -> Result<Vec<usize>> {
+    let mut scored: Vec<(f32, usize)> = Vec::with_capacity(num_lists);
+    for c in 0..num_lists {
+        let cc = &centroids[c * dims..(c + 1) * dims];
+        let d = slate_simd::l2_sq(v, cc)?;
+        scored.push((d, c));
+    }
+    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    scored.truncate(count);
+    Ok(scored.into_iter().map(|(_, c)| c).collect())
+}
+
 /// Rewrite `src` into a brand-new store at `dst`, permuting rows by `order`
 /// (`order[new_id] = old_id`): row `new_id` of the output holds the vector
 /// `src` stored at row `order[new_id]`. The output reuses `src`'s exact block
@@ -2103,6 +2354,185 @@ mod tests {
         (0..n)
             .map(|_| (0..dims).map(|_| rng.next_f64() as f32).collect())
             .collect()
+    }
+
+    /// Mean recall@`k` of a built index against the in-RAM brute-force oracle,
+    /// over `queries` random queries drawn from the same generator family.
+    fn sharded_mean_recall(
+        index: &HnswIndex,
+        store: &VectorStore<slate_storage::MmapBackend>,
+        vectors: &[Vec<f32>],
+        k: usize,
+        queries: usize,
+        query_seed: u64,
+    ) -> f64 {
+        let dims = vectors[0].len();
+        let cfg = SearchConfig {
+            k,
+            ef_search: 64,
+            ..SearchConfig::default()
+        };
+        let mut rng = SplitMix64::new(query_seed);
+        let mut total = 0.0f64;
+        for _ in 0..queries {
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+            let (res, _stats) = index.search(store, &query, &cfg).unwrap();
+            let truth: std::collections::HashSet<u64> =
+                naive_knn(vectors, &query, Metric::L2, k).into_iter().collect();
+            let hits = res.iter().filter(|n| truth.contains(&n.id.get())).count();
+            total += hits as f64 / k as f64;
+        }
+        total / queries as f64
+    }
+
+    #[test]
+    fn sharded_build_recall_is_comparable_to_monolithic() {
+        let dims = 16;
+        let n = 400;
+        let vectors = clustered_vectors(2024, n, dims);
+        let (_tmp, store) = build_store(&vectors, dims);
+        let params = HnswParams {
+            m: 16,
+            m_max: 32,
+            ef_construction: 200,
+            ..HnswParams::default()
+        };
+
+        let sharded =
+            HnswIndex::build_sharded(&store, Metric::L2, &params, 4, 2, 777).unwrap();
+        assert_eq!(sharded.len(), n);
+        assert!(!sharded.has_pq(), "sharded build produces a PQ-less graph");
+
+        let recall = sharded_mean_recall(&sharded, &store, &vectors, 10, 30, 7);
+        assert!(
+            recall >= 0.80,
+            "sharded recall@10 ({recall:.4}) must clear the floor"
+        );
+    }
+
+    #[test]
+    fn sharded_single_shard_matches_monolithic() {
+        let dims = 16;
+        let n = 300;
+        let vectors = clustered_vectors(99, n, dims);
+        let (_tmp, store) = build_store(&vectors, dims);
+        let params = HnswParams {
+            m: 16,
+            m_max: 32,
+            ef_construction: 200,
+            ..HnswParams::default()
+        };
+
+        // num_shards <= 1 must fall back to the monolithic builder with the same
+        // seed, producing a byte-identical graph.
+        let mono = HnswIndex::build(&store, Metric::L2, &params, 555).unwrap();
+        let sharded =
+            HnswIndex::build_sharded(&store, Metric::L2, &params, 1, 2, 555).unwrap();
+
+        assert_eq!(sharded.len(), mono.len());
+        assert_eq!(sharded.edge_count(0), mono.edge_count(0));
+
+        let cfg = SearchConfig {
+            k: 10,
+            ef_search: 64,
+            ..SearchConfig::default()
+        };
+        let mut rng = SplitMix64::new(7);
+        for _ in 0..20 {
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+            let (a, _) = mono.search(&store, &query, &cfg).unwrap();
+            let (b, _) = sharded.search(&store, &query, &cfg).unwrap();
+            let ai: Vec<u64> = a.iter().map(|n| n.id.get()).collect();
+            let bi: Vec<u64> = b.iter().map(|n| n.id.get()).collect();
+            assert_eq!(ai, bi, "single-shard search must match monolithic");
+        }
+    }
+
+    #[test]
+    fn sharded_build_caps_out_degree() {
+        let dims = 16;
+        let n = 400;
+        let vectors = clustered_vectors(321, n, dims);
+        let (_tmp, store) = build_store(&vectors, dims);
+        let params = HnswParams {
+            m: 16,
+            m_max: 32,
+            ef_construction: 200,
+            ..HnswParams::default()
+        };
+
+        let sharded =
+            HnswIndex::build_sharded(&store, Metric::L2, &params, 6, 2, 4242).unwrap();
+        // The merge unions out-edges across shards, then re-caps. No node may
+        // exceed the layer cap (m_max on layer 0).
+        for layer in 0..=sharded.max_layer() {
+            let cap = if layer == 0 { params.m_max } else { params.m };
+            for node in &sharded.adjacency[layer] {
+                assert!(
+                    node.len() <= cap,
+                    "layer {layer} node degree {} exceeds cap {cap}",
+                    node.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sharded_build_is_deterministic() {
+        let dims = 16;
+        let n = 400;
+        let vectors = clustered_vectors(2025, n, dims);
+        let (_tmp, store) = build_store(&vectors, dims);
+        let params = HnswParams {
+            m: 16,
+            m_max: 32,
+            ef_construction: 200,
+            ..HnswParams::default()
+        };
+
+        let a = HnswIndex::build_sharded(&store, Metric::L2, &params, 5, 2, 4242).unwrap();
+        let b = HnswIndex::build_sharded(&store, Metric::L2, &params, 5, 2, 4242).unwrap();
+
+        assert_eq!(a.edge_count(0), b.edge_count(0));
+        assert_eq!(a.node_levels, b.node_levels);
+        assert_eq!(a.entry_point, b.entry_point);
+
+        let cfg = SearchConfig {
+            k: 10,
+            ef_search: 64,
+            ..SearchConfig::default()
+        };
+        let mut rng = SplitMix64::new(13);
+        for _ in 0..20 {
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
+            let (ra, _) = a.search(&store, &query, &cfg).unwrap();
+            let (rb, _) = b.search(&store, &query, &cfg).unwrap();
+            let ia: Vec<u64> = ra.iter().map(|n| n.id.get()).collect();
+            let ib: Vec<u64> = rb.iter().map(|n| n.id.get()).collect();
+            assert_eq!(ia, ib, "sharded builds with equal seed must be identical");
+        }
+    }
+
+    #[test]
+    fn sharded_edge_cases_empty_and_single() {
+        let dims = 8;
+        let params = HnswParams::default();
+
+        // Empty store.
+        let (_tmp_e, empty) = build_store(&[], dims);
+        let idx_e = HnswIndex::build_sharded(&empty, Metric::L2, &params, 4, 2, 1).unwrap();
+        assert!(idx_e.is_empty());
+        let cfg = SearchConfig::default();
+        let (res_e, _) = idx_e.search(&empty, &vec![0.0; dims], &cfg).unwrap();
+        assert!(res_e.is_empty());
+
+        // Single vector (num_shards >= len falls back to monolithic build).
+        let single = vec![vec![0.5f32; dims]];
+        let (_tmp_s, store_s) = build_store(&single, dims);
+        let idx_s = HnswIndex::build_sharded(&store_s, Metric::L2, &params, 4, 2, 1).unwrap();
+        assert_eq!(idx_s.len(), 1);
+        let (res_s, _) = idx_s.search(&store_s, &single[0], &cfg).unwrap();
+        assert_eq!(res_s[0].id.get(), 0);
     }
 
     #[test]
