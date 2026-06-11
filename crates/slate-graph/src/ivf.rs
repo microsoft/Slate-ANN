@@ -44,6 +44,8 @@ use slate_core::{
 };
 use slate_storage::{FetchSchedule, IoBackend, VectorStore};
 
+use serde::{Deserialize, Serialize};
+
 /// Per-search statistics, exposing the physical work the storage-aware cost
 /// model prices. Mirrors [`crate::HnswStats`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,9 +60,9 @@ pub struct IvfStats {
 ///
 /// The centroids and posting lists are resident; the vectors themselves stay on
 /// disk and are streamed (in coalesced seek order) only for the candidates of a
-/// probed query. On-disk persistence of the centroids and posting lists is
-/// Phase 9.
-#[derive(Debug, Clone)]
+/// probed query. The index serializes to disk via [`serde`] (see
+/// `slate_index::format`); the vectors stay in their own store file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IvfIndex {
     /// Coarse centroids, row-major: centroid `c` occupies
     /// `[c*dims .. (c+1)*dims]`. There are `num_lists` of them.

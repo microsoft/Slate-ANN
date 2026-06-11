@@ -91,6 +91,8 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::rng::SplitMix64;
 
 /// k-means iterations used to train the PQ codebook during a PQ-enabled build.
@@ -114,7 +116,7 @@ const SHARD_SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Parameters controlling graph shape, mirroring [`slate_core::HnswParams`] but
 /// resolved into the fields the builder uses directly.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct GraphParams {
     /// Neighbor cap on layers above 0.
     m: usize,
@@ -201,7 +203,7 @@ impl Ord for Candidate {
 /// The index stores only graph topology and a little per-node metadata; vectors
 /// are read from the backing [`VectorStore`] on demand at search time. Build it
 /// with [`HnswIndex::build`], query it with [`HnswIndex::search`].
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HnswIndex {
     /// `adjacency[layer][node]` = neighbor ids of `node` on `layer`.
     /// Layer 0 covers all nodes; higher layers cover progressively fewer.

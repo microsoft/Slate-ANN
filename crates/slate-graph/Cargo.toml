@@ -13,6 +13,7 @@ slate-core = { workspace = true }
 slate-simd = { workspace = true }
 slate-storage = { workspace = true }
 slate-pq = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

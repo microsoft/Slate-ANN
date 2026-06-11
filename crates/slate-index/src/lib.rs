@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod brute;
+pub mod format;
 
 pub use brute::brute_force_search;
 pub use slate_core::{cmp_ascending, Neighbor, TopK};

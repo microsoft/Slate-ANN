@@ -765,6 +765,7 @@ name = "slate-graph"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "serde",
  "slate-core",
  "slate-pq",
  "slate-simd",
