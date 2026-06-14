@@ -154,6 +154,32 @@ impl<B: IoBackend> VectorStore<B> {
     /// [`Error::DimensionMismatch`] if `out.len() != dimensions`, or an I/O
     /// error from the backend.
     pub fn get_into(&self, index: usize, out: &mut [f32]) -> Result<()> {
+        // Throwaway decode buffer; identical behaviour to a direct read. Loops
+        // that read many narrow vectors should call `get_into_scratch` with a
+        // reused buffer to avoid the per-call allocation.
+        let mut scratch = Vec::new();
+        self.get_into_scratch(index, out, &mut scratch)
+    }
+
+    /// Like [`Self::get_into`], but reuses a caller-owned byte buffer for the
+    /// narrow-dtype decode step instead of allocating one per call.
+    ///
+    /// The `f32` path is zero-copy and ignores `scratch`. For `f16`/`i8` stores
+    /// the slot bytes are read into `scratch` (resized as needed) and widened to
+    /// `f32`. Pass the same `scratch` across a read loop to keep the narrow read
+    /// path allocation-free — useful for index builds and bulk scans on
+    /// low-power devices.
+    ///
+    /// # Errors
+    /// Returns [`Error::NotFound`] if `index >= len`,
+    /// [`Error::DimensionMismatch`] if `out.len() != dimensions`, or an I/O
+    /// error from the backend.
+    pub fn get_into_scratch(
+        &self,
+        index: usize,
+        out: &mut [f32],
+        scratch: &mut Vec<u8>,
+    ) -> Result<()> {
         if index >= self.len() {
             return Err(Error::NotFound(VectorId::new(index as u64)));
         }
@@ -170,16 +196,11 @@ impl<B: IoBackend> VectorStore<B> {
                 let dst: &mut [u8] = bytemuck::cast_slice_mut(out);
                 self.backend.read_exact_at(offset, dst)?;
             }
-            Dtype::F16 => {
-                // Read the narrow slot, then widen to f32.
-                let mut buf = vec![0u8; self.layout.vector_bytes()];
-                self.backend.read_exact_at(offset, &mut buf)?;
-                crate::codec::decode_f16(&buf, out)?;
-            }
-            Dtype::I8 => {
-                let mut buf = vec![0u8; self.layout.vector_bytes()];
-                self.backend.read_exact_at(offset, &mut buf)?;
-                crate::codec::decode_i8(&buf, out)?;
+            Dtype::F16 | Dtype::I8 => {
+                // Read the narrow slot into the reusable buffer, then widen.
+                scratch.resize(self.layout.vector_bytes(), 0);
+                self.backend.read_exact_at(offset, scratch)?;
+                Self::decode_slot(self.header.dtype, scratch, out)?;
             }
         }
         Ok(())
@@ -465,6 +486,48 @@ mod tests {
         // +4B scale is dwarfed by dims=64).
         assert!(f16_len < f32_len, "f16 {f16_len} !< f32 {f32_len}");
         assert!(i8_len < f16_len, "i8 {i8_len} !< f16 {f16_len}");
+    }
+
+    #[test]
+    fn get_into_scratch_matches_get_into_across_dtypes_and_backends() {
+        // Backend-generic body: get_into_scratch (reusing one buffer across the
+        // whole loop) must produce byte-identical vectors to get_into, and must
+        // leave the scratch empty for the zero-copy f32 path.
+        fn check<B: IoBackend>(store: &VectorStore<B>, dtype: Dtype, dims: usize, count: usize) {
+            let mut scratch: Vec<u8> = Vec::new();
+            let mut a = vec![0.0f32; dims];
+            let mut b = vec![0.0f32; dims];
+            for i in 0..count {
+                store.get_into(i, &mut a).unwrap();
+                store.get_into_scratch(i, &mut b, &mut scratch).unwrap();
+                assert_eq!(a, b, "{dtype:?} vec {i}: get_into vs get_into_scratch");
+            }
+            if dtype == Dtype::F32 {
+                assert!(scratch.is_empty(), "f32 must not allocate scratch");
+            } else {
+                assert_eq!(scratch.len(), store.layout().vector_bytes());
+            }
+        }
+
+        let dims = 12;
+        let count = 90;
+        for dtype in [Dtype::F32, Dtype::F16, Dtype::I8] {
+            let (_dir, path) = write_store_dtype(dtype, dims, 512, count);
+            check(&VectorStore::open_mmap(&path).unwrap(), dtype, dims, count);
+            check(&VectorStore::open_pread(&path).unwrap(), dtype, dims, count);
+        }
+    }
+
+    #[test]
+    fn get_into_scratch_rejects_wrong_buffer_len() {
+        let (_dir, path) = write_store(8, 256, 3);
+        let store = VectorStore::open_mmap(&path).unwrap();
+        let mut buf = [0.0f32; 7];
+        let mut scratch = Vec::new();
+        assert!(matches!(
+            store.get_into_scratch(0, &mut buf, &mut scratch),
+            Err(Error::DimensionMismatch { expected: 8, got: 7 })
+        ));
     }
 }
 

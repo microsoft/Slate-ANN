@@ -29,14 +29,16 @@ use crate::layout::BlockLayout;
 ///
 /// Produced by [`FetchSchedule::plan`]. Holds the requested indices in
 /// ascending physical-offset order together with the coalesced cost of
-/// servicing them: `seeks` (== `runs`) head positionings and `bytes` of
-/// payload transferred.
+/// servicing them: `seeks` (== `runs`) head positionings, `bytes` of useful
+/// payload, and `span_bytes` of bytes actually streamed off the platter
+/// (payload plus the block padding dragged along inside the coalesced runs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchSchedule {
     order: Vec<usize>,
     seeks: u64,
     runs: u64,
     bytes: u64,
+    span_bytes: u64,
 }
 
 impl FetchSchedule {
@@ -46,10 +48,15 @@ impl FetchSchedule {
     /// The indices are sorted ascending and de-duplicated (so the same vector
     /// requested twice is fetched once), then walked to count coalesced runs:
     /// a new run begins only where the next index's block is neither equal to
-    /// nor one past the previous index's block. `seeks` equals `runs`; `bytes`
-    /// is the payload of the unique vectors (`unique_count * vector_bytes`),
-    /// not the span of the runs — read-amplification accounting is deferred
-    /// until whole-block reads land.
+    /// nor one past the previous index's block. `seeks` equals `runs`.
+    ///
+    /// Two byte counts are reported. `bytes` is the useful payload of the unique
+    /// vectors (`unique_count * vector_bytes`). `span_bytes` is the bytes
+    /// actually streamed off the platter: the sum over coalesced runs of each
+    /// run's contiguous byte span (see [`BlockLayout::run_span`]), which includes
+    /// the block-tail padding and skipped slots dragged along inside a run.
+    /// `span_bytes >= bytes` always; the gap is read amplification, and it is
+    /// `span_bytes` that drives the honest transfer term of the cost model.
     ///
     /// An empty `indices` yields an empty, zero-cost schedule.
     #[must_use]
@@ -60,6 +67,7 @@ impl FetchSchedule {
                 seeks: 0,
                 runs: 0,
                 bytes: 0,
+                span_bytes: 0,
             };
         }
 
@@ -73,22 +81,38 @@ impl FetchSchedule {
 
         // Count coalesced runs over the swept order. Same block or adjacent
         // block continues the current run; a gap of >= 2 blocks is a new seek.
+        // For each closed run, add the contiguous span the executor reads —
+        // payload plus the padding swept along inside the run.
         let mut runs: u64 = 0;
+        let mut span_bytes: u64 = 0;
         let mut prev_block: Option<usize> = None;
+        let mut run_first = order[0];
+        let mut run_last = order[0];
         for &i in &order {
             let block = layout.block_of(i);
             let continues = matches!(prev_block, Some(pb) if block == pb || block == pb + 1);
-            if !continues {
+            if continues {
+                run_last = i;
+            } else {
+                if prev_block.is_some() {
+                    // Close the previous run.
+                    span_bytes += layout.run_span(run_first, run_last).1 as u64;
+                }
                 runs += 1;
+                run_first = i;
+                run_last = i;
             }
             prev_block = Some(block);
         }
+        // Close the final run.
+        span_bytes += layout.run_span(run_first, run_last).1 as u64;
 
         Self {
             order,
             seeks: runs,
             runs,
             bytes,
+            span_bytes,
         }
     }
 
@@ -112,10 +136,22 @@ impl FetchSchedule {
         self.runs
     }
 
-    /// Total payload bytes transferred (`unique_count * vector_bytes`).
+    /// Total payload bytes transferred (`unique_count * vector_bytes`). This is
+    /// the useful data; compare against [`Self::span_bytes`] to see read
+    /// amplification.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Total bytes physically streamed off the platter: the sum over coalesced
+    /// runs of each run's contiguous span, including block-tail padding and
+    /// skipped slots dragged along inside a run. Always `>= bytes()`; this is
+    /// the value to charge the cost model's transfer term, since it is the data
+    /// the disk actually moves.
+    #[must_use]
+    pub fn span_bytes(&self) -> u64 {
+        self.span_bytes
     }
 
     /// Group [`Self::order`] into coalesced runs, each returned as a
@@ -265,6 +301,55 @@ mod tests {
         assert_eq!(len, layout.vector_offset(7) + layout.vector_bytes() as usize - layout.vector_offset(5));
     }
 
+    #[test]
+    fn span_bytes_equal_payload_for_one_packed_run() {
+        // 64 vectors/block, all in block 0, no padding between them => the run
+        // spans exactly the payload of the four vectors.
+        let layout = wide_block();
+        let plan = FetchSchedule::plan(&layout, &[0, 1, 2, 3]);
+        assert_eq!(plan.runs(), 1);
+        assert_eq!(plan.span_bytes(), plan.bytes());
+        assert_eq!(plan.span_bytes(), 4 * layout.vector_bytes() as u64);
+    }
+
+    #[test]
+    fn span_bytes_exceed_payload_when_padding_is_dragged() {
+        // 1 vector/block: a run over adjacent blocks 5,6,7 reads three whole
+        // blocks but only carries three vectors of payload. With block_size 16
+        // == vector_bytes there is no intra-block padding, so the gap comes from
+        // the slots that *would* sit between them if the block held more — here
+        // it is exactly payload (each block is one slot). Use a layout with
+        // spare room per block so padding actually appears.
+        let layout = BlockLayout::new(Dtype::F32, 4, 64).unwrap(); // 16B vec, 4/block
+        // Indices 0 and 4 live in blocks 0 and 1 (adjacent) => one run. The
+        // executor streams from slot 0 of block 0 through slot 0 of block 1,
+        // i.e. across block 0's three trailing slots of padding.
+        let plan = FetchSchedule::plan(&layout, &[0, 4]);
+        assert_eq!(plan.runs(), 1);
+        assert!(plan.span_bytes() > plan.bytes());
+        // Payload is two vectors; the span reaches from block 0 slot 0 to block
+        // 1 slot 0 inclusive.
+        assert_eq!(plan.bytes(), 2 * layout.vector_bytes() as u64);
+        let (_, len) = layout.run_span(0, 4);
+        assert_eq!(plan.span_bytes(), len as u64);
+    }
+
+    #[test]
+    fn span_bytes_sum_matches_per_run_spans() {
+        // Blocks {0,1, 5, 9,10} over 1-vector blocks => runs {0,1}, {5}, {9,10}.
+        let layout = one_per_block();
+        let plan = FetchSchedule::plan(&layout, &[10, 0, 9, 1, 5]);
+        let order = plan.order();
+        let mut expected = 0u64;
+        for (start, count) in plan.run_spans(&layout) {
+            let first = order[start];
+            let last = order[start + count - 1];
+            expected += layout.run_span(first, last).1 as u64;
+        }
+        assert_eq!(plan.span_bytes(), expected);
+        assert!(plan.span_bytes() >= plan.bytes());
+    }
+
     proptest::proptest! {
         #[test]
         fn invariants_hold(
@@ -309,12 +394,21 @@ mod tests {
             let spans = plan.run_spans(&layout);
             proptest::prop_assert_eq!(spans.len() as u64, plan.runs());
             let mut next = 0usize;
+            let mut expected_span_bytes = 0u64;
             for (start, count) in &spans {
                 proptest::prop_assert_eq!(*start, next);
                 proptest::prop_assert!(*count >= 1);
+                let first = order[*start];
+                let last = order[*start + *count - 1];
+                expected_span_bytes += layout.run_span(first, last).1 as u64;
                 next += count;
             }
             proptest::prop_assert_eq!(next, order.len());
+
+            // span_bytes equals the summed run spans and never undercounts the
+            // payload it carries.
+            proptest::prop_assert_eq!(plan.span_bytes(), expected_span_bytes);
+            proptest::prop_assert!(plan.span_bytes() >= plan.bytes());
         }
     }
 }

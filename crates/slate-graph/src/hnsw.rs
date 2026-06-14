@@ -1457,9 +1457,11 @@ impl HnswIndex {
                         Ok(())
                     })?;
 
-                    // One coalesced storage charge for the whole batch: the same
-                    // payload bytes, but only `plan.seeks()` head positionings.
-                    counters.add_read(plan.bytes(), plan.seeks(), plan.runs());
+                    // One coalesced storage charge for the whole batch: the
+                    // bytes actually streamed off the platter (payload plus any
+                    // padding dragged along inside a run), but only
+                    // `plan.seeks()` head positionings.
+                    counters.add_read(plan.span_bytes(), plan.seeks(), plan.runs());
                 }
             }
 
@@ -1881,8 +1883,11 @@ mod tests {
             let (nr, ns) = nar_index.search_hybrid(&nar_store, &query, &cfg).unwrap();
             f32_bytes += fs.counters.bytes_read;
             nar_bytes += ns.counters.bytes_read;
-            // Narrow byte accounting must equal fetches * stored footprint.
-            assert_eq!(
+            // Narrow byte accounting is at least fetches * stored footprint;
+            // coalesced runs may also stream padding and skipped slots.
+            assert!(
+                ns.counters.bytes_read >= ns.counters.exact_distances * nar_vbytes,
+                "narrow bytes_read {} below footprint floor {}",
                 ns.counters.bytes_read,
                 ns.counters.exact_distances * nar_vbytes
             );
@@ -1959,8 +1964,15 @@ mod tests {
                 c.exact_distances
             );
             assert_eq!(c.sequential_runs, c.seeks, "runs must equal seeks");
-            // Payload accounting unchanged by coalescing.
-            assert_eq!(c.bytes_read, c.exact_distances * vector_bytes);
+            // Honest streamed-byte accounting: a coalesced run drags along any
+            // padding and skipped slots between fetched vectors, so bytes_read
+            // is at least the payload of the vectors actually scored.
+            assert!(
+                c.bytes_read >= c.exact_distances * vector_bytes,
+                "bytes_read {} below payload floor {}",
+                c.bytes_read,
+                c.exact_distances * vector_bytes
+            );
             // If anything was fetched, at least one seek was issued.
             if c.exact_distances > 0 {
                 assert!(c.seeks >= 1);

@@ -272,7 +272,7 @@ impl IvfIndex {
             Ok(())
         })?;
         // One coalesced storage charge for the whole probe.
-        counters.add_read(plan.bytes(), plan.seeks(), plan.runs());
+        counters.add_read(plan.span_bytes(), plan.seeks(), plan.runs());
 
         Ok((topk.into_sorted_vec(), IvfStats { counters }))
     }
