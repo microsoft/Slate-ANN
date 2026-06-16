@@ -1316,8 +1316,6 @@ impl HnswIndex {
         // each subspace's centroids. Built once, reused for every node.
         let adc = slate_pq::AdcTable::build(codebook, query)?;
 
-        let mut scratch = vec![0.0f32; self.dims];
-
         // Upper layers: greedy beam-1 descent on APPROXIMATE distance only. The
         // PQ codes are in RAM, so the entire funnel down to layer 0 costs zero
         // disk seeks; layer 0's exact ranking then corrects the entry choice.
@@ -1350,7 +1348,6 @@ impl HnswIndex {
             current,
             ef,
             config,
-            &mut scratch,
             &mut counters,
         )?;
 
@@ -1381,7 +1378,6 @@ impl HnswIndex {
         entry: u32,
         ef: usize,
         config: &SearchConfig,
-        scratch: &mut [f32],
         counters: &mut QueryCounters,
     ) -> Result<Vec<Candidate>> {
         // `discovered`: approximate score computed (queued or beyond).
@@ -1436,15 +1432,16 @@ impl HnswIndex {
                     let plan = slate_storage::FetchSchedule::plan(store.layout(), &indices);
 
                     // Execute the plan with one positioned read per coalesced
-                    // run (not one per vector): `fetch_scheduled` streams each
-                    // contiguous run off the platter once and hands back each
-                    // decoded vector in seek order. The closure counts the visit
-                    // and the exact distance but not the read — the batch's reads
-                    // are charged once below from the coalesced plan.
+                    // run (not one per vector): `fetch_scheduled_distances`
+                    // streams each contiguous run off the platter once and
+                    // computes the exact distance straight from the on-disk
+                    // representation — for narrow (f16/i8) stores this skips the
+                    // decode-to-f32 round trip via the native SIMD kernels. The
+                    // closure counts the visit and the exact distance but not the
+                    // read; the batch's reads are charged once below.
                     let metric = self.metric;
-                    store.fetch_scheduled(&plan, scratch, |idx, vec| {
+                    store.fetch_scheduled_distances(&plan, query, metric, |idx, exact| {
                         let node = idx as u32;
-                        let exact = slate_simd::distance(metric, query, vec)?;
                         counters.visit_node();
                         counters.add_exact(1);
                         exact_known[node as usize] = true;

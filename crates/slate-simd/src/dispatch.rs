@@ -182,3 +182,123 @@ pub fn cosine_parts(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
         }
     }
 }
+
+// --- Narrow-stored kernel dispatch (f32 query vs f16/i8 store) ----------------
+//
+// Narrow kernels do not share `BinaryKernel` (extra `stored`/`scale`+`codes`
+// args), so they branch on the cached tier each call like `cosine_parts`. The
+// `f16` widen needs an extra CPU feature beyond the base tier — `f16c` on
+// x86-64, `fp16` on aarch64 — so the `f16` paths consult [`f16_simd_ok`] and
+// fall back to the scalar oracle when it is absent. The `i8` paths need nothing
+// beyond the base tier.
+
+/// Whether the active tier can run the native `f16` widen (`vcvtph2ps`).
+///
+/// AVX-512F already implies `_mm512_cvtph_ps`; the AVX2 path additionally needs
+/// `f16c`; the NEON path needs `fp16`. Cached for the process.
+#[must_use]
+fn f16_simd_ok() -> bool {
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| match active_tier() {
+        #[cfg(target_arch = "x86_64")]
+        Tier::Avx512 => true,
+        #[cfg(target_arch = "x86_64")]
+        Tier::Avx2 => is_x86_feature_detected!("f16c"),
+        #[cfg(target_arch = "aarch64")]
+        Tier::Neon => std::arch::is_aarch64_feature_detected!("fp16"),
+        _ => false,
+    })
+}
+
+/// Dispatch `l2_sq` between an `f32` query and an `f16` store.
+#[must_use]
+pub fn l2_sq_f16(query: &[f32], stored: &[u8]) -> f32 {
+    if f16_simd_ok() {
+        match active_tier() {
+            #[cfg(target_arch = "x86_64")]
+            Tier::Avx512 => return unsafe { avx512::l2_sq_f16(query, stored) }, // SAFETY: tier-gated
+            #[cfg(target_arch = "x86_64")]
+            Tier::Avx2 => return unsafe { avx2::l2_sq_f16(query, stored) }, // SAFETY: tier+f16c-gated
+            #[cfg(target_arch = "aarch64")]
+            Tier::Neon => return unsafe { neon::l2_sq_f16(query, stored) }, // SAFETY: tier+fp16-gated
+            _ => {}
+        }
+    }
+    scalar::l2_sq_f16(query, stored)
+}
+
+/// Dispatch raw `dot` between an `f32` query and an `f16` store.
+#[must_use]
+pub fn dot_f16(query: &[f32], stored: &[u8]) -> f32 {
+    if f16_simd_ok() {
+        match active_tier() {
+            #[cfg(target_arch = "x86_64")]
+            Tier::Avx512 => return unsafe { avx512::dot_f16(query, stored) }, // SAFETY: tier-gated
+            #[cfg(target_arch = "x86_64")]
+            Tier::Avx2 => return unsafe { avx2::dot_f16(query, stored) }, // SAFETY: tier+f16c-gated
+            #[cfg(target_arch = "aarch64")]
+            Tier::Neon => return unsafe { neon::dot_f16(query, stored) }, // SAFETY: tier+fp16-gated
+            _ => {}
+        }
+    }
+    scalar::dot_f16(query, stored)
+}
+
+/// Dispatch cosine accumulators for an `f32` query and an `f16` store.
+#[must_use]
+pub fn cosine_parts_f16(query: &[f32], stored: &[u8]) -> (f32, f32, f32) {
+    if f16_simd_ok() {
+        match active_tier() {
+            #[cfg(target_arch = "x86_64")]
+            Tier::Avx512 => return unsafe { avx512::cosine_parts_f16(query, stored) }, // SAFETY: tier-gated
+            #[cfg(target_arch = "x86_64")]
+            Tier::Avx2 => return unsafe { avx2::cosine_parts_f16(query, stored) }, // SAFETY: tier+f16c-gated
+            #[cfg(target_arch = "aarch64")]
+            Tier::Neon => return unsafe { neon::cosine_parts_f16(query, stored) }, // SAFETY: tier+fp16-gated
+            _ => {}
+        }
+    }
+    scalar::cosine_parts_f16(query, stored)
+}
+
+/// Dispatch `l2_sq` between an `f32` query and an `i8` store.
+#[must_use]
+pub fn l2_sq_i8(query: &[f32], scale: f32, codes: &[i8]) -> f32 {
+    match active_tier() {
+        #[cfg(target_arch = "x86_64")]
+        Tier::Avx512 => unsafe { avx512::l2_sq_i8(query, scale, codes) }, // SAFETY: tier-gated
+        #[cfg(target_arch = "x86_64")]
+        Tier::Avx2 => unsafe { avx2::l2_sq_i8(query, scale, codes) }, // SAFETY: tier-gated
+        #[cfg(target_arch = "aarch64")]
+        Tier::Neon => unsafe { neon::l2_sq_i8(query, scale, codes) }, // SAFETY: tier-gated
+        _ => scalar::l2_sq_i8(query, scale, codes),
+    }
+}
+
+/// Dispatch raw `dot` between an `f32` query and an `i8` store.
+#[must_use]
+pub fn dot_i8(query: &[f32], scale: f32, codes: &[i8]) -> f32 {
+    match active_tier() {
+        #[cfg(target_arch = "x86_64")]
+        Tier::Avx512 => unsafe { avx512::dot_i8(query, scale, codes) }, // SAFETY: tier-gated
+        #[cfg(target_arch = "x86_64")]
+        Tier::Avx2 => unsafe { avx2::dot_i8(query, scale, codes) }, // SAFETY: tier-gated
+        #[cfg(target_arch = "aarch64")]
+        Tier::Neon => unsafe { neon::dot_i8(query, scale, codes) }, // SAFETY: tier-gated
+        _ => scalar::dot_i8(query, scale, codes),
+    }
+}
+
+/// Dispatch cosine accumulators for an `f32` query and an `i8` store.
+#[must_use]
+pub fn cosine_parts_i8(query: &[f32], scale: f32, codes: &[i8]) -> (f32, f32, f32) {
+    match active_tier() {
+        #[cfg(target_arch = "x86_64")]
+        Tier::Avx512 => unsafe { avx512::cosine_parts_i8(query, scale, codes) }, // SAFETY: tier-gated
+        #[cfg(target_arch = "x86_64")]
+        Tier::Avx2 => unsafe { avx2::cosine_parts_i8(query, scale, codes) }, // SAFETY: tier-gated
+        #[cfg(target_arch = "aarch64")]
+        Tier::Neon => unsafe { neon::cosine_parts_i8(query, scale, codes) }, // SAFETY: tier-gated
+        _ => scalar::cosine_parts_i8(query, scale, codes),
+    }
+}

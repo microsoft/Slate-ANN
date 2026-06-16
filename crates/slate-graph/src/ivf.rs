@@ -260,13 +260,13 @@ impl IvfIndex {
         }
 
         // ---- FETCH + EXACT RANK: stream the candidates in coalesced seek order
-        // and rank them by the index's exact metric. One positioned read per run.
+        // and rank them by the index's exact metric. One positioned read per run;
+        // narrow (f16/i8) stores rank straight from the on-disk bytes via the
+        // native SIMD kernels, skipping the decode-to-f32 round trip.
         let plan = FetchSchedule::plan(store.layout(), &candidates);
         let metric = self.metric;
         let mut topk = TopK::new(config.k);
-        let mut scratch = vec![0.0f32; self.dims];
-        store.fetch_scheduled(&plan, &mut scratch, |idx, vec| {
-            let exact = slate_simd::distance(metric, query, vec)?;
+        store.fetch_scheduled_distances(&plan, query, metric, |idx, exact| {
             counters.add_exact(1);
             topk.offer(Neighbor::new(VectorId::new(idx as u64), exact));
             Ok(())

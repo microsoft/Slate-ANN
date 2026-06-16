@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 slate-core = { workspace = true }
+slate-simd = { workspace = true }
 memmap2 = { workspace = true }
 bytemuck = { workspace = true }
 half = { workspace = true }

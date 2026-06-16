@@ -286,6 +286,87 @@ impl<B: IoBackend> VectorStore<B> {
         Ok(())
     }
 
+    /// Execute a [`FetchSchedule`], computing each vector's distance to `query`
+    /// directly against its on-disk representation.
+    ///
+    /// Like [`Self::fetch_scheduled`] this issues one positioned read per
+    /// coalesced run, but instead of decoding every slot to `f32` it hands the
+    /// raw stored bytes to the native narrow-store kernels
+    /// ([`slate_simd::distance_f16`] / [`slate_simd::distance_i8`]). For `F16`
+    /// and `I8` stores this skips the decode-to-`f32` round trip entirely: the
+    /// SIMD kernel folds the widen into its reduction. `F32` stores decode the
+    /// slot into a reusable scratch buffer (a `bytemuck` cast of the unaligned
+    /// run buffer would be unsound) and use the plain `f32` kernel, so the
+    /// numeric result is bit-identical to `fetch_scheduled` + `distance` on
+    /// every dtype.
+    ///
+    /// `visit` is called with the dense index and the computed distance, in
+    /// `plan.order()` order. The caller charges the storage counters once for
+    /// the batch via `plan.span_bytes()/seeks()/runs()`.
+    ///
+    /// # Errors
+    /// Returns [`Error::DimensionMismatch`] if `query.len() != dimensions`, an
+    /// I/O error from the backend, or a distance-kernel error.
+    pub fn fetch_scheduled_distances<F>(
+        &self,
+        plan: &crate::schedule::FetchSchedule,
+        query: &[f32],
+        metric: slate_core::Metric,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, f32) -> Result<()>,
+    {
+        if query.len() != self.dimensions() {
+            return Err(Error::DimensionMismatch {
+                expected: self.dimensions(),
+                got: query.len(),
+            });
+        }
+        let order = plan.order();
+        let vbytes = self.layout.vector_bytes();
+        let dtype = self.header.dtype;
+        let mut run_buf: Vec<u8> = Vec::new();
+        // Only the F32 path needs a decoded copy (the run buffer is byte-aligned
+        // only, so it cannot be reinterpreted as `&[f32]` in place).
+        let mut scratch: Vec<f32> = if dtype == Dtype::F32 {
+            vec![0.0; self.dimensions()]
+        } else {
+            Vec::new()
+        };
+        for (start, count) in plan.run_spans(&self.layout) {
+            let first = order[start];
+            let last = order[start + count - 1];
+            let (offset, len) = self.layout.run_span(first, last);
+            let _ = self.backend.advise_range(offset, len, Advice::WillNeed);
+            run_buf.resize(len, 0);
+            self.backend.read_exact_at(offset, &mut run_buf)?;
+            for &index in &order[start..start + count] {
+                let rel = self.layout.vector_offset(index) - offset;
+                let slot = &run_buf[rel..rel + vbytes];
+                let dist = match dtype {
+                    Dtype::F32 => {
+                        Self::decode_slot(Dtype::F32, slot, &mut scratch)?;
+                        slate_simd::distance(metric, query, &scratch)?
+                    }
+                    Dtype::F16 => slate_simd::distance_f16(metric, query, slot)?,
+                    Dtype::I8 => {
+                        let (scale_bytes, code_bytes) = slot.split_at(4);
+                        let scale = f32::from_le_bytes(
+                            scale_bytes
+                                .try_into()
+                                .expect("split_at(4) yields exactly 4 bytes"),
+                        );
+                        let codes: &[i8] = bytemuck::cast_slice(code_bytes);
+                        slate_simd::distance_i8(metric, query, scale, codes)?
+                    }
+                };
+                visit(index, dist)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Convenience: fetch by [`VectorId`], treating its value as dense index.
     ///
     /// # Errors
