@@ -263,7 +263,10 @@ impl<B: IoBackend> VectorStore<B> {
         }
         let order = plan.order();
         let vbytes = self.layout.vector_bytes();
-        let mut run_buf: Vec<u8> = Vec::new();
+        // Reused across runs: one tight buffer per wanted slot (`slot_bufs`) plus
+        // a sink for the inter-slot gap bytes a `preadv` still streams.
+        let mut slot_bufs: Vec<u8> = Vec::new();
+        let mut sink: Vec<u8> = Vec::new();
         for (start, count) in plan.run_spans(&self.layout) {
             let first = order[start];
             let last = order[start + count - 1];
@@ -273,16 +276,66 @@ impl<B: IoBackend> VectorStore<B> {
             let _ = self
                 .backend
                 .advise_range(offset, len, Advice::WillNeed);
-            run_buf.resize(len, 0);
-            self.backend.read_exact_at(offset, &mut run_buf)?;
-            // Slice each vector out of the run buffer at its span-relative byte
-            // offset and decode into `scratch`.
-            for &index in &order[start..start + count] {
-                let rel = self.layout.vector_offset(index) - offset;
-                Self::decode_slot(self.header.dtype, &run_buf[rel..rel + vbytes], scratch)?;
+            // Scatter the contiguous run directly into per-slot buffers (gaps go
+            // to a throwaway sink), eliminating the run_buf -> slot copy.
+            self.scatter_run(&order[start..start + count], offset, len, vbytes, &mut slot_bufs, &mut sink)?;
+            // Decode each wanted slot straight out of its tight buffer.
+            for (i, &index) in order[start..start + count].iter().enumerate() {
+                let slot = &slot_bufs[i * vbytes..(i + 1) * vbytes];
+                Self::decode_slot(self.header.dtype, slot, scratch)?;
                 visit(index, scratch)?;
             }
         }
+        Ok(())
+    }
+
+    /// Read a single coalesced run as a vectored scatter: each wanted slot lands
+    /// in its own tight region of `slot_bufs` (`vbytes` each, in order), and the
+    /// inter-slot gap bytes a contiguous `preadv` still transfers are dropped
+    /// into `sink`. Issues exactly one [`IoBackend::read_vectored_at`] per run.
+    ///
+    /// `indices` are the run's wanted dense indices in physical order; `offset`
+    /// and `len` are the run span. `slot_bufs`/`sink` are caller-owned and reused
+    /// across runs (resized here).
+    ///
+    /// # Errors
+    /// Propagates the backend I/O error.
+    fn scatter_run(
+        &self,
+        indices: &[usize],
+        offset: usize,
+        len: usize,
+        vbytes: usize,
+        slot_bufs: &mut Vec<u8>,
+        sink: &mut Vec<u8>,
+    ) -> Result<()> {
+        let count = indices.len();
+        slot_bufs.clear();
+        slot_bufs.resize(count * vbytes, 0);
+        // Gap bytes = run length minus the slot bytes we actually want.
+        sink.clear();
+        sink.resize(len - count * vbytes, 0);
+
+        // Walk the run front-to-back building the iovec list in source order:
+        // [gap?, slot0, gap?, slot1, ...]. The first slot starts the run so it
+        // has no leading gap; there is no trailing gap after the last slot.
+        let mut slot_chunks = slot_bufs.chunks_mut(vbytes);
+        let mut sink_rest: &mut [u8] = sink.as_mut_slice();
+        let mut iovecs: Vec<std::io::IoSliceMut<'_>> = Vec::with_capacity(count * 2);
+        let mut prev_end = 0usize; // byte offset within the run of the last consumed slot's end
+        for &index in indices {
+            let rel = self.layout.vector_offset(index) - offset;
+            let gap = rel - prev_end;
+            if gap > 0 {
+                let (g, rest) = sink_rest.split_at_mut(gap);
+                sink_rest = rest;
+                iovecs.push(std::io::IoSliceMut::new(g));
+            }
+            let slot = slot_chunks.next().expect("one chunk per wanted slot");
+            iovecs.push(std::io::IoSliceMut::new(slot));
+            prev_end = rel + vbytes;
+        }
+        self.backend.read_vectored_at(offset, &mut iovecs)?;
         Ok(())
     }
 
@@ -326,8 +379,9 @@ impl<B: IoBackend> VectorStore<B> {
         let order = plan.order();
         let vbytes = self.layout.vector_bytes();
         let dtype = self.header.dtype;
-        let mut run_buf: Vec<u8> = Vec::new();
-        // Only the F32 path needs a decoded copy (the run buffer is byte-aligned
+        let mut slot_bufs: Vec<u8> = Vec::new();
+        let mut sink: Vec<u8> = Vec::new();
+        // Only the F32 path needs a decoded copy (the slot buffer is byte-aligned
         // only, so it cannot be reinterpreted as `&[f32]` in place).
         let mut scratch: Vec<f32> = if dtype == Dtype::F32 {
             vec![0.0; self.dimensions()]
@@ -339,11 +393,9 @@ impl<B: IoBackend> VectorStore<B> {
             let last = order[start + count - 1];
             let (offset, len) = self.layout.run_span(first, last);
             let _ = self.backend.advise_range(offset, len, Advice::WillNeed);
-            run_buf.resize(len, 0);
-            self.backend.read_exact_at(offset, &mut run_buf)?;
-            for &index in &order[start..start + count] {
-                let rel = self.layout.vector_offset(index) - offset;
-                let slot = &run_buf[rel..rel + vbytes];
+            self.scatter_run(&order[start..start + count], offset, len, vbytes, &mut slot_bufs, &mut sink)?;
+            for (i, &index) in order[start..start + count].iter().enumerate() {
+                let slot = &slot_bufs[i * vbytes..(i + 1) * vbytes];
                 let dist = match dtype {
                     Dtype::F32 => {
                         Self::decode_slot(Dtype::F32, slot, &mut scratch)?;

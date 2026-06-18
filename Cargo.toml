@@ -37,6 +37,7 @@ memmap2 = "0.9"
 bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 
 # Dev / bench
 proptest = "1"

@@ -556,6 +556,18 @@ mod tests {
             self.inner.read_exact_at(offset, buf)
         }
 
+        fn read_vectored_at(
+            &self,
+            offset: usize,
+            bufs: &mut [std::io::IoSliceMut<'_>],
+        ) -> Result<()> {
+            // One vectored scatter == one positioned read == one seek, so it
+            // must tally as a single read (not once per destination buffer) for
+            // the coalescing invariant `reads == seeks == runs` to hold.
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read_vectored_at(offset, bufs)
+        }
+
         fn advise_range(&self, offset: usize, len: usize, advice: Advice) -> Result<()> {
             self.inner.advise_range(offset, len, advice)
         }
