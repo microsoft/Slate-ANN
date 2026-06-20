@@ -79,11 +79,23 @@ pub struct IvfIndex {
     metric: Metric,
     /// Number of nearest cells to probe per query (resolved from config).
     num_probes: usize,
+    /// Optional product-quantizer codebook for the ADC rerank gate. `None` for a
+    /// plain index built with [`IvfIndex::build`].
+    codebook: Option<slate_pq::PqCodebook>,
+    /// Flat per-vector PQ codes (`len * codebook.code_len()` bytes), resident in
+    /// RAM for the in-memory ADC ranking. Empty when there is no codebook.
+    codes: Vec<u8>,
 }
 
 /// k-means iterations are taken from [`IvfParams::max_kmeans_iters`]; the seed
 /// is mixed so it is decorrelated from any graph seed sharing the same value.
 const IVF_SEED_MIX: u64 = 0x2545_F491_4F6C_DD1D;
+
+/// Product-quantizer training iterations for the ADC rerank gate.
+const PQ_TRAIN_ITERS: usize = 25;
+
+/// Seed mix for the PQ codebook, decorrelated from the coarse-quantizer seed.
+const IVF_PQ_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
 impl IvfIndex {
     /// Build an IVF index over every vector in `store`.
@@ -106,6 +118,38 @@ impl IvfIndex {
         params: &IvfParams,
         seed: u64,
     ) -> Result<Self> {
+        Self::build_inner(store, metric, params, None, seed)
+    }
+
+    /// Build an IVF index with a product-quantizer ADC rerank tier.
+    ///
+    /// Identical coarse-quantizer and posting-list construction as
+    /// [`Self::build`], plus a [`slate_pq::PqCodebook`] trained on the corpus and
+    /// a resident per-vector code for each vector. The codebook gates which
+    /// candidates are exact-fetched in [`Self::search_hybrid`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::build`], plus codebook-training errors (e.g. `dims` not
+    /// divisible by `pq.num_subquantizers`).
+    pub fn build_with_pq<B: IoBackend>(
+        store: &VectorStore<B>,
+        metric: Metric,
+        params: &IvfParams,
+        pq: &slate_core::PqParams,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::build_inner(store, metric, params, Some(pq), seed)
+    }
+
+    /// Shared construction for [`Self::build`] and [`Self::build_with_pq`].
+    fn build_inner<B: IoBackend>(
+        store: &VectorStore<B>,
+        metric: Metric,
+        params: &IvfParams,
+        pq: Option<&slate_core::PqParams>,
+        seed: u64,
+    ) -> Result<Self> {
         let dims = store.dimensions();
         let len = store.len();
 
@@ -119,6 +163,8 @@ impl IvfIndex {
                 len: 0,
                 metric,
                 num_probes: params.num_probes,
+                codebook: None,
+                codes: Vec::new(),
             });
         }
 
@@ -161,6 +207,23 @@ impl IvfIndex {
             list.sort_unstable();
         }
 
+        // Optional PQ tier: train a codebook over the same corpus and encode
+        // every vector to a resident code for the ADC rerank gate.
+        let (codebook, codes) = match pq {
+            Some(p) => {
+                let cb = slate_pq::PqCodebook::train(
+                    &data,
+                    dims,
+                    p,
+                    PQ_TRAIN_ITERS,
+                    seed ^ IVF_PQ_SEED_MIX,
+                )?;
+                let codes = cb.encode_batch(&data)?;
+                (Some(cb), codes)
+            }
+            None => (None, Vec::new()),
+        };
+
         Ok(Self {
             centroids,
             postings,
@@ -169,6 +232,8 @@ impl IvfIndex {
             len,
             metric,
             num_probes: params.num_probes,
+            codebook,
+            codes,
         })
     }
 
@@ -276,6 +341,105 @@ impl IvfIndex {
 
         Ok((topk.into_sorted_vec(), IvfStats { counters }))
     }
+
+    /// Search with a PQ-ADC rerank gate: probe the coarse lists, then rank the
+    /// merged candidates by in-RAM approximate (PQ/ADC) distance and only
+    /// exact-fetch the best `rerank_ratio` fraction.
+    ///
+    /// Where [`Self::search`] streams *every* candidate of the probed cells off
+    /// disk, `search_hybrid` first scores each candidate with the resident PQ
+    /// codes (a handful of table lookups, no I/O), keeps the
+    /// `clamp(ceil(candidates * rerank_ratio), 1, fetch_batch_size)` best, and
+    /// only those are read and ranked by the exact metric. The PQ score is a
+    /// *gate*; the exact metric still decides the final order. This drops
+    /// `bytes_read`, `seeks`, and `exact_distances` at a fixed `num_probes`.
+    ///
+    /// Requires an index built with [`Self::build_with_pq`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DimensionMismatch`] if `query.len() != dimensions`,
+    /// [`Error::Unsupported`] if the index has no PQ tier, or an I/O / kernel
+    /// error from the fetch.
+    pub fn search_hybrid<B: IoBackend>(
+        &self,
+        store: &VectorStore<B>,
+        query: &[f32],
+        config: &SearchConfig,
+    ) -> Result<(Vec<Neighbor>, IvfStats)> {
+        if query.len() != self.dims {
+            return Err(Error::DimensionMismatch {
+                expected: self.dims,
+                got: query.len(),
+            });
+        }
+        let mut counters = QueryCounters::new();
+        if self.len == 0 || self.num_lists == 0 {
+            return Ok((Vec::new(), IvfStats { counters }));
+        }
+        let Some(codebook) = self.codebook.as_ref() else {
+            return Err(Error::unsupported(
+                "search_hybrid requires an index built with build_with_pq (no PQ tier present)",
+            ));
+        };
+
+        // ---- PROBE: rank coarse centroids by exact squared-L2 (RAM only).
+        let probes = self.num_probes.min(self.num_lists).max(1);
+        let mut centroid_scores: Vec<(f32, usize)> = Vec::with_capacity(self.num_lists);
+        for c in 0..self.num_lists {
+            let cc = &self.centroids[c * self.dims..(c + 1) * self.dims];
+            let d = slate_simd::l2_sq(query, cc)?;
+            centroid_scores.push((d, c));
+        }
+        counters.add_approx(self.num_lists as u64);
+        centroid_scores
+            .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        centroid_scores.truncate(probes);
+
+        // ---- CANDIDATES: union + dedup the probed posting lists (ascending ids).
+        let mut candidates: Vec<usize> = Vec::new();
+        for &(_, c) in &centroid_scores {
+            for &id in &self.postings[c] {
+                candidates.push(id as usize);
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        if candidates.is_empty() {
+            return Ok((Vec::new(), IvfStats { counters }));
+        }
+
+        // ---- ADC GATE: score every candidate against the asymmetric ADC table
+        // built from the un-quantized query, using the resident codes. No disk.
+        let adc = slate_pq::AdcTable::build(codebook, query)?;
+        let mut scored: Vec<(f32, usize)> = Vec::with_capacity(candidates.len());
+        for &id in &candidates {
+            scored.push((adc.distance_at(&self.codes, id)?, id));
+        }
+        counters.add_approx(candidates.len() as u64);
+        scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        // Keep the best `rerank_ratio` fraction (at least one, capped by the
+        // fetch batch budget), then restore ascending order for the scheduler.
+        let budget = ((candidates.len() as f32 * config.rerank_ratio).ceil() as usize)
+            .clamp(1, config.fetch_batch_size);
+        let mut top: Vec<usize> = scored.iter().take(budget).map(|&(_, id)| id).collect();
+        top.sort_unstable();
+
+        // ---- FETCH + EXACT RANK: only the gated candidates, in seek order.
+        let plan = FetchSchedule::plan(store.layout(), &top);
+        let metric = self.metric;
+        let mut topk = TopK::new(config.k);
+        store.fetch_scheduled_distances(&plan, query, metric, |idx, exact| {
+            counters.add_exact(1);
+            topk.offer(Neighbor::new(VectorId::new(idx as u64), exact));
+            Ok(())
+        })?;
+        counters.add_read(plan.span_bytes(), plan.seeks(), plan.runs());
+
+        Ok((topk.into_sorted_vec(), IvfStats { counters }))
+    }
 }
 
 /// Indices of the `count` centroids nearest to `v` by squared-L2, smallest
@@ -300,9 +464,9 @@ fn nearest_centroids(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::rng::SplitMix64;
-    use slate_core::{Dtype, StorageParams};
+        use super::*;
+        use crate::rng::SplitMix64;
+        use slate_core::{Dtype, PqParams, StorageParams};
     use slate_storage::{Advice, BlockLayout, MmapBackend, StoreWriter};
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -632,5 +796,157 @@ mod tests {
         assert_eq!(total_reads as u64, total_runs);
         let recall = total_recall / queries as f64;
         assert!(recall >= 0.80, "recall@10 {recall:.3} below floor 0.80");
+    }
+
+    /// Small PQ params for tests: 4 subquantizers, 6 bits/code (mirrors the HNSW
+    /// `hybrid_pq` helper).
+    fn ivf_pq() -> PqParams {
+        PqParams {
+            num_subquantizers: 4,
+            bits_per_code: 6,
+        }
+    }
+
+    /// Mean recall@k of the PQ-ADC-gated `search_hybrid` against the in-RAM
+    /// ground truth, mirroring [`mean_recall`] but exercising the rerank gate.
+    fn mean_recall_hybrid(
+        index: &IvfIndex,
+        store: &VectorStore<MmapBackend>,
+        vectors: &[Vec<f32>],
+        k: usize,
+        queries: usize,
+        query_seed: u64,
+    ) -> f64 {
+        let dims = vectors[0].len();
+        let cfg = SearchConfig {
+            k,
+            ..SearchConfig::default()
+        };
+        let mut rng = SplitMix64::new(query_seed);
+        let mut total = 0.0f64;
+        for _ in 0..queries {
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32 * 10.0).collect();
+            let (res, _stats) = index.search_hybrid(store, &query, &cfg).unwrap();
+            let truth: HashSet<u64> =
+                naive_knn(vectors, &query, Metric::L2, k).into_iter().collect();
+            let hits = res.iter().filter(|n| truth.contains(&n.id.get())).count();
+            total += hits as f64 / k as f64;
+        }
+        total / queries as f64
+    }
+
+    #[test]
+    fn hybrid_recall_is_comparable_to_exact() {
+        // The ADC gate fetches only the top `rerank_ratio` of candidates, so it
+        // trades a little recall for far fewer exact fetches. It should still
+        // clear a conservative floor on well-separated clustered data.
+        let dims = 16;
+        let n = 400;
+        let vectors = clustered_vectors(2024, n, dims);
+        let (_tmp, store) = build_store(&vectors, dims);
+        let index =
+            IvfIndex::build_with_pq(&store, Metric::L2, &ivf_params(16, 8, 2), &ivf_pq(), 555)
+                .unwrap();
+        let recall = mean_recall_hybrid(&index, &store, &vectors, 10, 30, 7);
+        assert!(recall >= 0.70, "hybrid recall@10 {recall:.3} below floor 0.70");
+    }
+
+    #[test]
+    fn hybrid_streams_fewer_than_exact() {
+        // At fixed nprobe, the PQ gate must compute fewer exact distances and
+        // read no more bytes than the exact-rank-everything path.
+        let dims = 16;
+        let n = 400;
+        let vectors = clustered_vectors(2024, n, dims);
+        let (_tmp, store) = build_store(&vectors, dims);
+        let params = ivf_params(16, 8, 2);
+        let plain = IvfIndex::build(&store, Metric::L2, &params, 555).unwrap();
+        let hybrid =
+            IvfIndex::build_with_pq(&store, Metric::L2, &params, &ivf_pq(), 555).unwrap();
+
+        let cfg = SearchConfig {
+            k: 10,
+            ..SearchConfig::default()
+        };
+        let mut rng = SplitMix64::new(7);
+        let mut plain_exact = 0u64;
+        let mut hybrid_exact = 0u64;
+        let mut plain_bytes = 0u64;
+        let mut hybrid_bytes = 0u64;
+        let queries = 30;
+        for _ in 0..queries {
+            let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32 * 10.0).collect();
+            let (_p, ps) = plain.search(&store, &query, &cfg).unwrap();
+            let (_h, hs) = hybrid.search_hybrid(&store, &query, &cfg).unwrap();
+            plain_exact += ps.counters.exact_distances;
+            hybrid_exact += hs.counters.exact_distances;
+            plain_bytes += ps.counters.bytes_read;
+            hybrid_bytes += hs.counters.bytes_read;
+        }
+        assert!(
+            hybrid_exact < plain_exact,
+            "gate did not cut exact distances: hybrid {hybrid_exact} >= plain {plain_exact}"
+        );
+        assert!(
+            hybrid_bytes <= plain_bytes,
+            "gate read more bytes: hybrid {hybrid_bytes} > plain {plain_bytes}"
+        );
+    }
+
+    #[test]
+    fn search_hybrid_without_pq_is_unsupported() {
+        let dims = 8;
+        let vectors = clustered_vectors(1, 80, dims);
+        let (_tmp, store) = build_store(&vectors, dims);
+        let index = IvfIndex::build(&store, Metric::L2, &ivf_params(8, 4, 2), 555).unwrap();
+        let query = vec![0.1f32; dims];
+        let cfg = SearchConfig::default();
+        let err = index.search_hybrid(&store, &query, &cfg).unwrap_err();
+        match err {
+            Error::Unsupported(msg) => {
+                assert!(
+                    msg.contains("build_with_pq"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hybrid_empty_store_is_empty() {
+        let (_tmp, store) = build_store(&[], 8);
+        let index =
+            IvfIndex::build_with_pq(&store, Metric::L2, &ivf_params(8, 4, 2), &ivf_pq(), 555)
+                .unwrap();
+        assert!(index.is_empty());
+        let query = vec![0.0f32; 8];
+        let (res, stats) = index
+            .search_hybrid(&store, &query, &SearchConfig::default())
+            .unwrap();
+        assert!(res.is_empty());
+        assert_eq!(stats.counters.exact_distances, 0);
+    }
+
+    #[test]
+    fn hybrid_is_deterministic() {
+        let dims = 16;
+        let vectors = clustered_vectors(4242, 300, dims);
+        let (_tmp, store) = build_store(&vectors, dims);
+        let params = ivf_params(16, 6, 2);
+        let a = IvfIndex::build_with_pq(&store, Metric::L2, &params, &ivf_pq(), 4242).unwrap();
+        let b = IvfIndex::build_with_pq(&store, Metric::L2, &params, &ivf_pq(), 4242).unwrap();
+
+        let cfg = SearchConfig {
+            k: 10,
+            ..SearchConfig::default()
+        };
+        let query: Vec<f32> = (0..dims).map(|j| (j as f32) * 0.3).collect();
+        let (ids_a, stats_a) = a.search_hybrid(&store, &query, &cfg).unwrap();
+        let (ids_b, stats_b) = b.search_hybrid(&store, &query, &cfg).unwrap();
+        let ids_a: Vec<u64> = ids_a.iter().map(|n| n.id.get()).collect();
+        let ids_b: Vec<u64> = ids_b.iter().map(|n| n.id.get()).collect();
+        assert_eq!(ids_a, ids_b);
+        assert_eq!(stats_a.counters, stats_b.counters);
     }
 }
