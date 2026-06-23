@@ -749,6 +749,7 @@ dependencies = [
  "clap",
  "slate-core",
  "slate-index",
+ "tempfile",
 ]
 
 [[package]]

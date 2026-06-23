@@ -16,3 +16,6 @@ path = "src/main.rs"
 slate-core = { workspace = true }
 slate-index = { workspace = true }
 clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
