@@ -1,7 +1,7 @@
 //! `slate` — the command-line front end for the Slate-ANN disk-backed vector
 //! search engine.
 //!
-//! Two subcommands are wired in this first Phase-10 cut:
+//! Three subcommands are wired in Phase 10:
 //!
 //! - `slate build <vectors> <out>` reads a plain-text vector file (one vector
 //!   per line, whitespace-separated `f32`), writes a self-describing index
@@ -10,16 +10,23 @@
 //!   parameters.
 //! - `slate query <bundle> <query> --k N` opens such a bundle and prints the
 //!   `k` nearest neighbours of the first query vector as `id score` lines.
+//! - `slate bench <bundle> <queries> --profile P` runs a query workload, times
+//!   it, accumulates the [`QueryCounters`] the engine records, and prices them
+//!   through [`QueryCost::estimate`] against a [`StorageProfile`] so the
+//!   storage fraction of modeled latency is a printed number.
 //!
 //! The plain-text format is deliberately dependency-free; richer binary inputs
-//! (`fvecs`/`npy`), a `bench` subcommand, and incremental updates are deferred
-//! to later Phase-10 turns.
+//! (`fvecs`/`npy`) and incremental updates are deferred to later Phase-10 turns.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use slate_core::{BuildConfig, Error, IndexBackend, Metric, Result, SearchConfig};
+use slate_core::{
+    BuildConfig, DistanceCost, Error, IndexBackend, Metric, QueryCost, QueryCounters, Result,
+    SearchConfig, StorageProfile,
+};
 
 #[derive(Parser)]
 #[command(
@@ -60,6 +67,22 @@ enum Commands {
         #[arg(long, default_value_t = 10)]
         k: usize,
     },
+    /// Benchmark a bundle over a query workload and price the storage cost.
+    Bench {
+        /// Bundle directory produced by `slate build`.
+        bundle: PathBuf,
+        /// Plain-text query file; every vector is run as one query.
+        queries: PathBuf,
+        /// Number of neighbours to return per query.
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Storage profile to price the cost model against: `hdd`, `ssd`, or `memory`.
+        #[arg(long, default_value = "hdd")]
+        profile: String,
+        /// Also measure recall@k against the exact brute-force oracle.
+        #[arg(long)]
+        recall: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -73,6 +96,13 @@ fn main() -> ExitCode {
             seed,
         } => run_build(&vectors, &out, &backend, &metric, seed),
         Commands::Query { bundle, query, k } => run_query(&bundle, &query, k),
+        Commands::Bench {
+            bundle,
+            queries,
+            k,
+            profile,
+            recall,
+        } => run_bench(&bundle, &queries, k, &profile, recall),
     };
 
     match result {
@@ -140,6 +170,109 @@ fn run_query(bundle: &Path, query: &Path, k: usize) -> Result<()> {
     Ok(())
 }
 
+/// Run every vector in `queries` against the bundle, time the workload, and
+/// price the accumulated counters through the cost model for `profile`.
+fn run_bench(bundle: &Path, queries: &Path, k: usize, profile: &str, recall: bool) -> Result<()> {
+    let index = slate_index::open_bundle(bundle)?;
+    let expected = index.config().dimensions;
+    let metric = index.config().metric;
+    let profile_name = profile;
+    let profile = parse_profile(profile)?;
+
+    let (dims, rows) = read_vectors_text(queries)?;
+    if dims != expected {
+        return Err(Error::DimensionMismatch {
+            expected,
+            got: dims,
+        });
+    }
+    if rows.is_empty() {
+        return Err(Error::invalid_config(format!(
+            "query file {} contains no vectors",
+            queries.display()
+        )));
+    }
+
+    let config = SearchConfig {
+        k,
+        ..SearchConfig::default()
+    };
+
+    let mut total = QueryCounters::new();
+    let mut elapsed = std::time::Duration::ZERO;
+    let mut total_recall = 0.0f64;
+
+    for query in &rows {
+        let start = std::time::Instant::now();
+        let (neighbours, counters) = index.search(query, &config)?;
+        elapsed += start.elapsed();
+        total.merge(&counters);
+
+        if recall {
+            let truth = slate_index::brute_force_search(index.store(), query, metric, &config)?;
+            let truth_ids: HashSet<u64> = truth.iter().map(|n| n.id.get()).collect();
+            let hits = neighbours
+                .iter()
+                .filter(|n| truth_ids.contains(&n.id.get()))
+                .count();
+            let denom = config.k.max(1) as f64;
+            total_recall += hits as f64 / denom;
+        }
+    }
+
+    // Representative per-distance compute costs; calibrated values come from
+    // offline SIMD micro-benchmarking per dim/dtype/ISA.
+    let cost = DistanceCost::new(5e-9, 200e-9);
+    let modeled = QueryCost::estimate(&total, profile, cost);
+
+    let n = rows.len() as f64;
+    let measured_ms = elapsed.as_secs_f64() / n * 1_000.0;
+
+    println!(
+        "bench: {q} queries, k={k}, profile={profile_name}",
+        q = rows.len()
+    );
+    println!("  measured mean latency: {measured_ms:.4} ms/query");
+    println!("  mean counters per query:");
+    println!("    nodes_visited:    {:.1}", total.nodes_visited as f64 / n);
+    println!(
+        "    approx_distances: {:.1}",
+        total.approx_distances as f64 / n
+    );
+    println!(
+        "    exact_distances:  {:.1}",
+        total.exact_distances as f64 / n
+    );
+    println!("    seeks:            {:.1}", total.seeks as f64 / n);
+    println!(
+        "    sequential_runs:  {:.1}",
+        total.sequential_runs as f64 / n
+    );
+    println!("    bytes_read:       {:.0}", total.bytes_read as f64 / n);
+    println!("  modeled QueryCost per query (profile={profile_name}):");
+    println!(
+        "    traversal:        {:.4} ms",
+        modeled.traversal_s / n * 1_000.0
+    );
+    println!(
+        "    storage_access:   {:.4} ms",
+        modeled.storage_access_s / n * 1_000.0
+    );
+    println!(
+        "    distance:         {:.4} ms",
+        modeled.distance_s / n * 1_000.0
+    );
+    println!(
+        "    total:            {:.4} ms",
+        modeled.total_s() / n * 1_000.0
+    );
+    println!("    storage_fraction: {:.3}", modeled.storage_fraction());
+    if recall {
+        println!("  mean recall@{k}: {:.4}", total_recall / n);
+    }
+    Ok(())
+}
+
 /// Parse a whitespace-separated plain-text vector file. The dimensionality is
 /// inferred from the first non-blank line; blank lines are skipped and any row
 /// whose width differs is reported as a [`Error::DimensionMismatch`].
@@ -200,6 +333,17 @@ fn parse_metric(s: &str) -> Result<Metric> {
         "inner" | "ip" | "dot" => Ok(Metric::InnerProduct),
         other => Err(Error::invalid_config(format!(
             "unknown metric {other:?} (expected `l2`, `cosine`, or `inner`)"
+        ))),
+    }
+}
+
+fn parse_profile(s: &str) -> Result<StorageProfile> {
+    match s.to_ascii_lowercase().as_str() {
+        "hdd" | "hdd_7200rpm" => Ok(StorageProfile::hdd_7200rpm()),
+        "ssd" | "nvme" => Ok(StorageProfile::ssd_nvme()),
+        "memory" | "mem" | "ram" => Ok(StorageProfile::memory()),
+        other => Err(Error::invalid_config(format!(
+            "unknown storage profile {other:?} (expected `hdd`, `ssd`, or `memory`)"
         ))),
     }
 }

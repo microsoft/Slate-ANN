@@ -83,3 +83,74 @@ fn unknown_backend_is_rejected() {
         .expect("spawn slate build");
     assert!(!build.success(), "unknown backend should fail the build");
 }
+
+/// Build a small bundle and return its directory inside `dir`.
+fn build_small_bundle(dir: &std::path::Path) -> std::path::PathBuf {
+    let vectors_path = dir.join("vectors.txt");
+    let bundle_path = dir.join("bundle");
+    fs::write(
+        &vectors_path,
+        "0 0 0 0\n\
+         9 9 9 9\n\
+         1 2 3 4\n\
+         5 5 5 5\n\
+         -1 -2 -3 -4\n",
+    )
+    .unwrap();
+    let build = Command::new(slate_bin())
+        .arg("build")
+        .arg(&vectors_path)
+        .arg(&bundle_path)
+        .status()
+        .expect("spawn slate build");
+    assert!(build.success(), "`slate build` failed");
+    bundle_path
+}
+
+#[test]
+fn bench_reports_cost_and_recall() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = build_small_bundle(dir.path());
+    let queries_path = dir.path().join("queries.txt");
+    fs::write(&queries_path, "1 2 3 4\n5 5 5 5\n").unwrap();
+
+    let bench = Command::new(slate_bin())
+        .arg("bench")
+        .arg(&bundle_path)
+        .arg(&queries_path)
+        .arg("--k")
+        .arg("3")
+        .arg("--profile")
+        .arg("hdd")
+        .arg("--recall")
+        .output()
+        .expect("spawn slate bench");
+    assert!(bench.status.success(), "`slate bench` failed");
+
+    let stdout = String::from_utf8(bench.stdout).unwrap();
+    assert!(stdout.contains("bench: 2 queries"), "report header: {stdout:?}");
+    assert!(stdout.contains("storage_fraction"), "missing cost model: {stdout:?}");
+    assert!(stdout.contains("recall@3"), "missing recall line: {stdout:?}");
+}
+
+#[test]
+fn bench_without_recall_omits_recall_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = build_small_bundle(dir.path());
+    let queries_path = dir.path().join("queries.txt");
+    fs::write(&queries_path, "1 2 3 4\n").unwrap();
+
+    let bench = Command::new(slate_bin())
+        .arg("bench")
+        .arg(&bundle_path)
+        .arg(&queries_path)
+        .arg("--profile")
+        .arg("ssd")
+        .output()
+        .expect("spawn slate bench");
+    assert!(bench.status.success(), "`slate bench` failed");
+
+    let stdout = String::from_utf8(bench.stdout).unwrap();
+    assert!(stdout.contains("profile=ssd"), "profile not echoed: {stdout:?}");
+    assert!(!stdout.contains("recall@"), "recall should be omitted: {stdout:?}");
+}
