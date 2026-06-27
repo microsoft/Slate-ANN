@@ -20,7 +20,9 @@
 pub mod brute;
 pub mod bundle;
 pub mod format;
+pub mod update;
 
 pub use brute::brute_force_search;
 pub use bundle::{build_bundle, open_bundle, Bundle, BundleIndex, BundleManifest};
 pub use slate_core::{cmp_ascending, Neighbor, TopK};
+pub use update::UpdateLog;

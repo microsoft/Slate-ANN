@@ -154,3 +154,79 @@ fn bench_without_recall_omits_recall_line() {
     assert!(stdout.contains("profile=ssd"), "profile not echoed: {stdout:?}");
     assert!(!stdout.contains("recall@"), "recall should be omitted: {stdout:?}");
 }
+
+#[test]
+fn delete_removes_id_from_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = build_small_bundle(dir.path());
+    let query_path = dir.path().join("query.txt");
+    // Row index 2 ("1 2 3 4") is the exact match and would normally rank first.
+    fs::write(&query_path, "1 2 3 4\n").unwrap();
+
+    let delete = Command::new(slate_bin())
+        .arg("delete")
+        .arg(&bundle_path)
+        .arg("--id")
+        .arg("2")
+        .status()
+        .expect("spawn slate delete");
+    assert!(delete.success(), "`slate delete` failed");
+
+    let query = Command::new(slate_bin())
+        .arg("query")
+        .arg(&bundle_path)
+        .arg(&query_path)
+        .arg("--k")
+        .arg("3")
+        .output()
+        .expect("spawn slate query");
+    assert!(query.status.success(), "`slate query` failed");
+
+    let stdout = String::from_utf8(query.stdout).unwrap();
+    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let id = line.split_whitespace().next().unwrap();
+        assert_ne!(id, "2", "deleted id 2 should not appear: {stdout:?}");
+    }
+}
+
+#[test]
+fn insert_adds_a_new_vector() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = build_small_bundle(dir.path());
+    // A vector no stored row equals, so it is the strict nearest to its own query.
+    let newvec_path = dir.path().join("newvec.txt");
+    fs::write(&newvec_path, "7 7 7 7\n").unwrap();
+
+    let insert = Command::new(slate_bin())
+        .arg("insert")
+        .arg(&bundle_path)
+        .arg(&newvec_path)
+        .output()
+        .expect("spawn slate insert");
+    assert!(insert.status.success(), "`slate insert` failed");
+    let insert_out = String::from_utf8(insert.stdout).unwrap();
+    // Five stored vectors -> the buffered insert takes id 5.
+    assert!(insert_out.contains("inserted id 5"), "insert id: {insert_out:?}");
+
+    let query_path = dir.path().join("query.txt");
+    fs::write(&query_path, "7 7 7 7\n").unwrap();
+    let query = Command::new(slate_bin())
+        .arg("query")
+        .arg(&bundle_path)
+        .arg(&query_path)
+        .arg("--k")
+        .arg("1")
+        .output()
+        .expect("spawn slate query");
+    assert!(query.status.success(), "`slate query` failed");
+
+    let stdout = String::from_utf8(query.stdout).unwrap();
+    let nearest_id = stdout
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    assert_eq!(nearest_id, "5", "inserted vector should be nearest: {stdout:?}");
+}

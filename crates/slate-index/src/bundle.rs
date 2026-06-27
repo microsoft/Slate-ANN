@@ -20,11 +20,14 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use slate_core::{BuildConfig, Error, IndexBackend, Neighbor, QueryCounters, Result, SearchConfig};
+use slate_core::{
+    BuildConfig, Error, IndexBackend, Neighbor, QueryCounters, Result, SearchConfig, TopK, VectorId,
+};
 use slate_graph::{HnswIndex, IvfIndex};
 use slate_storage::{BlockLayout, MmapBackend, StoreWriter, VectorStore};
 
 use crate::format;
+use crate::update::UpdateLog;
 
 /// Magic string written at the head of every bundle manifest.
 pub const BUNDLE_MAGIC: &str = "SLATEANN-BUNDLE";
@@ -144,12 +147,14 @@ impl BundleIndex {
 }
 
 /// A bundle opened from disk: the resolved config, the memory-mapped vector
-/// store, and the deserialized index, ready to serve queries.
+/// store, the deserialized index, and the incremental update log overlay.
 #[derive(Debug)]
 pub struct Bundle {
     config: BuildConfig,
     store: VectorStore<MmapBackend>,
     index: BundleIndex,
+    dir: PathBuf,
+    updates: UpdateLog,
 }
 
 impl Bundle {
@@ -171,22 +176,107 @@ impl Bundle {
         &self.index
     }
 
-    /// Exact search over the bundle's store + index using the manifest metric.
+    /// The incremental update log (soft-deletes + buffered inserts).
+    #[must_use]
+    pub fn updates(&self) -> &UpdateLog {
+        &self.updates
+    }
+
+    /// Soft-delete a vector id (stored or buffered). Call [`Bundle::flush`] to
+    /// persist. Idempotent and never touches the frozen store/index.
+    pub fn delete(&mut self, id: VectorId) {
+        self.updates.delete(id.get());
+    }
+
+    /// Buffer a new vector and return its assigned id. The vector width must
+    /// match the bundle's dimensionality. Call [`Bundle::flush`] to persist.
+    pub fn insert(&mut self, vector: Vec<f32>) -> Result<VectorId> {
+        if vector.len() != self.config.dimensions {
+            return Err(Error::DimensionMismatch {
+                expected: self.config.dimensions,
+                got: vector.len(),
+            });
+        }
+        let id = self.updates.insert(vector);
+        Ok(VectorId::new(id))
+    }
+
+    /// Persist the update log to `updates.json` in the bundle directory.
+    pub fn flush(&self) -> Result<()> {
+        self.updates.save(&self.dir)
+    }
+
+    /// Exact search over the bundle's store + index, with the update log applied
+    /// (tombstoned ids filtered out, buffered inserts merged in).
     pub fn search(
         &self,
         query: &[f32],
         config: &SearchConfig,
     ) -> Result<(Vec<Neighbor>, QueryCounters)> {
-        self.index.search(&self.store, query, config)
+        if self.updates.is_empty() {
+            return self.index.search(&self.store, query, config);
+        }
+        self.apply_updates(self.index.search(
+            &self.store,
+            query,
+            &Self::over_fetch(config, self.updates.tombstones().len()),
+        )?, query, config)
     }
 
-    /// PQ-gated hybrid search (errors if the index has no PQ tier).
+    /// PQ-gated hybrid search (errors if the index has no PQ tier), with the
+    /// update log applied.
     pub fn search_hybrid(
         &self,
         query: &[f32],
         config: &SearchConfig,
     ) -> Result<(Vec<Neighbor>, QueryCounters)> {
-        self.index.search_hybrid(&self.store, query, config)
+        if self.updates.is_empty() {
+            return self.index.search_hybrid(&self.store, query, config);
+        }
+        self.apply_updates(self.index.search_hybrid(
+            &self.store,
+            query,
+            &Self::over_fetch(config, self.updates.tombstones().len()),
+        )?, query, config)
+    }
+
+    /// Over-fetch by the tombstone count so that, after filtering, at least `k`
+    /// surviving stored neighbours remain to fill the result.
+    fn over_fetch(config: &SearchConfig, extra: usize) -> SearchConfig {
+        SearchConfig {
+            k: config.k + extra,
+            ..*config
+        }
+    }
+
+    /// Drop tombstoned ids from the index hits and merge the buffered inserts,
+    /// returning the best `config.k` overall. `counters` reflect the index pass
+    /// only; the in-RAM buffer scan is not priced.
+    fn apply_updates(
+        &self,
+        (index_hits, counters): (Vec<Neighbor>, QueryCounters),
+        query: &[f32],
+        config: &SearchConfig,
+    ) -> Result<(Vec<Neighbor>, QueryCounters)> {
+        let mut topk = TopK::new(config.k);
+        for n in index_hits {
+            if !self.updates.is_tombstoned(n.id.get()) {
+                topk.offer(n);
+            }
+        }
+
+        let metric = self.config.metric;
+        let first = self.updates.first_insert_id();
+        for (i, vector) in self.updates.inserts().iter().enumerate() {
+            let id = first + i as u64;
+            if self.updates.is_tombstoned(id) {
+                continue;
+            }
+            let score = slate_simd::distance(metric, query, vector)?;
+            topk.offer(Neighbor::new(VectorId::new(id), score));
+        }
+
+        Ok((topk.into_sorted_vec(), counters))
     }
 }
 
@@ -284,10 +374,15 @@ pub fn open_bundle(dir: impl AsRef<Path>) -> Result<Bundle> {
         IndexBackend::Ivf => BundleIndex::Ivf(format::load_ivf(&index_path)?),
     };
 
+    let base_len = store.len() as u64;
+    let updates = UpdateLog::load(dir, base_len)?;
+
     Ok(Bundle {
         config: manifest.config,
         store,
         index,
+        dir: dir.to_path_buf(),
+        updates,
     })
 }
 
@@ -446,5 +541,127 @@ mod tests {
         let (res, counters) = bundle.search(&vec![0.1f32; dims], &cfg(10)).unwrap();
         assert!(res.is_empty());
         assert_eq!(counters.exact_distances, 0);
+    }
+
+    #[test]
+    fn empty_update_log_search_equals_plain() {
+        let dims = 12;
+        let vectors = gen_vectors(2024, 200, dims);
+        let dir = tempfile::tempdir().unwrap();
+        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 5).unwrap();
+        let bundle = open_bundle(dir.path()).unwrap();
+        assert!(bundle.updates().is_empty());
+
+        let queries = gen_vectors(99, 20, dims);
+        for q in &queries {
+            let (with_overlay, _) = bundle.search(q, &cfg(10)).unwrap();
+            let (plain, _) = bundle.index().search(bundle.store(), q, &cfg(10)).unwrap();
+            let a: Vec<u64> = with_overlay.iter().map(|n| n.id.get()).collect();
+            let b: Vec<u64> = plain.iter().map(|n| n.id.get()).collect();
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn delete_hides_a_stored_id_and_backfills() {
+        let dims = 12;
+        let vectors = gen_vectors(2024, 200, dims);
+        let dir = tempfile::tempdir().unwrap();
+        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 5).unwrap();
+        let mut bundle = open_bundle(dir.path()).unwrap();
+
+        // Query a stored vector by re-using it: top hit is itself (score 0).
+        let query = vectors[42].clone();
+        let (before, _) = bundle.search(&query, &cfg(5)).unwrap();
+        assert_eq!(before.len(), 5);
+        let top = before[0].id;
+        assert_eq!(top.get(), 42);
+
+        bundle.delete(top);
+        let (after, _) = bundle.search(&query, &cfg(5)).unwrap();
+        // Still k results (over-fetch backfilled), but the tombstoned id is gone.
+        assert_eq!(after.len(), 5);
+        assert!(after.iter().all(|n| n.id != top));
+    }
+
+    #[test]
+    fn insert_surfaces_a_matching_vector() {
+        let dims = 12;
+        let vectors = gen_vectors(2024, 200, dims);
+        let dir = tempfile::tempdir().unwrap();
+        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 5).unwrap();
+        let mut bundle = open_bundle(dir.path()).unwrap();
+        let base_len = bundle.store().len() as u64;
+
+        let newcomer: Vec<f32> = (0..dims).map(|j| 100.0 + j as f32).collect();
+        let new_id = bundle.insert(newcomer.clone()).unwrap();
+        assert_eq!(new_id.get(), base_len);
+
+        // Querying the exact inserted vector returns it first (score 0).
+        let (res, _) = bundle.search(&newcomer, &cfg(5)).unwrap();
+        assert_eq!(res[0].id, new_id);
+        assert!(res[0].score.abs() < 1e-6);
+    }
+
+    #[test]
+    fn insert_rejects_wrong_dimension() {
+        let dims = 8;
+        let vectors = gen_vectors(7, 40, dims);
+        let dir = tempfile::tempdir().unwrap();
+        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 1).unwrap();
+        let mut bundle = open_bundle(dir.path()).unwrap();
+        let err = bundle.insert(vec![0.0f32; 7]).unwrap_err();
+        assert!(
+            matches!(err, Error::DimensionMismatch { expected: 8, got: 7 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn insert_then_delete_same_buffered_id_is_hidden() {
+        let dims = 12;
+        let vectors = gen_vectors(2024, 200, dims);
+        let dir = tempfile::tempdir().unwrap();
+        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 5).unwrap();
+        let mut bundle = open_bundle(dir.path()).unwrap();
+
+        let newcomer: Vec<f32> = (0..dims).map(|j| 100.0 + j as f32).collect();
+        let new_id = bundle.insert(newcomer.clone()).unwrap();
+        bundle.delete(new_id);
+
+        let (res, _) = bundle.search(&newcomer, &cfg(5)).unwrap();
+        assert!(res.iter().all(|n| n.id != new_id));
+    }
+
+    #[test]
+    fn updates_persist_across_reopen() {
+        let dims = 12;
+        let vectors = gen_vectors(2024, 200, dims);
+        let dir = tempfile::tempdir().unwrap();
+        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 5).unwrap();
+
+        let newcomer: Vec<f32> = (0..dims).map(|j| 100.0 + j as f32).collect();
+        let new_id;
+        {
+            let mut bundle = open_bundle(dir.path()).unwrap();
+            bundle.delete(VectorId::new(42));
+            new_id = bundle.insert(newcomer.clone()).unwrap();
+            bundle.flush().unwrap();
+        }
+
+        // updates.json now sits beside the bundle files.
+        assert!(dir.path().join(crate::update::UPDATES_FILE).exists());
+
+        let bundle = open_bundle(dir.path()).unwrap();
+        assert!(bundle.updates().is_tombstoned(42));
+
+        // The deletion still applies.
+        let q42 = vectors[42].clone();
+        let (res, _) = bundle.search(&q42, &cfg(5)).unwrap();
+        assert!(res.iter().all(|n| n.id.get() != 42));
+
+        // The insert still surfaces.
+        let (ins, _) = bundle.search(&newcomer, &cfg(5)).unwrap();
+        assert_eq!(ins[0].id, new_id);
     }
 }

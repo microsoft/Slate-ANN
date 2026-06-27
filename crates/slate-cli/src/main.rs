@@ -14,6 +14,10 @@
 //!   it, accumulates the [`QueryCounters`] the engine records, and prices them
 //!   through [`QueryCost::estimate`] against a [`StorageProfile`] so the
 //!   storage fraction of modeled latency is a printed number.
+//! - `slate delete <bundle> --id N` and `slate insert <bundle> <vector>` edit a
+//!   bundle through its `updates.json` log: deletes tombstone a stored or
+//!   buffered id, inserts append a vector that is brute-scanned and merged into
+//!   results, all without rewriting the seek-optimised store or index.
 //!
 //! The plain-text format is deliberately dependency-free; richer binary inputs
 //! (`fvecs`/`npy`) and incremental updates are deferred to later Phase-10 turns.
@@ -25,7 +29,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use slate_core::{
     BuildConfig, DistanceCost, Error, IndexBackend, Metric, QueryCost, QueryCounters, Result,
-    SearchConfig, StorageProfile,
+    SearchConfig, StorageProfile, VectorId,
 };
 
 #[derive(Parser)]
@@ -83,6 +87,21 @@ enum Commands {
         #[arg(long)]
         recall: bool,
     },
+    /// Soft-delete a vector id from a bundle (records a tombstone in the log).
+    Delete {
+        /// Bundle directory produced by `slate build`.
+        bundle: PathBuf,
+        /// Vector id to tombstone (a stored id or a previously-inserted id).
+        #[arg(long)]
+        id: u64,
+    },
+    /// Insert a vector into a bundle's update log (buffered, brute-scanned).
+    Insert {
+        /// Bundle directory produced by `slate build`.
+        bundle: PathBuf,
+        /// Plain-text vector file; only the first vector is used.
+        vector: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -103,6 +122,8 @@ fn main() -> ExitCode {
             profile,
             recall,
         } => run_bench(&bundle, &queries, k, &profile, recall),
+        Commands::Delete { bundle, id } => run_delete(&bundle, id),
+        Commands::Insert { bundle, vector } => run_insert(&bundle, &vector),
     };
 
     match result {
@@ -270,6 +291,28 @@ fn run_bench(bundle: &Path, queries: &Path, k: usize, profile: &str, recall: boo
     if recall {
         println!("  mean recall@{k}: {:.4}", total_recall / n);
     }
+    Ok(())
+}
+
+/// Tombstone a vector id in the bundle's update log and persist it.
+fn run_delete(bundle: &Path, id: u64) -> Result<()> {
+    let mut bundle_handle = slate_index::open_bundle(bundle)?;
+    bundle_handle.delete(VectorId::new(id));
+    bundle_handle.flush()?;
+    println!("deleted id {id} from {path}", path = bundle.display());
+    Ok(())
+}
+
+/// Append the first vector of `vector` to the bundle's insert buffer and persist.
+fn run_insert(bundle: &Path, vector: &Path) -> Result<()> {
+    let mut bundle_handle = slate_index::open_bundle(bundle)?;
+    let (_dims, rows) = read_vectors_text(vector)?;
+    let first = rows.first().ok_or_else(|| {
+        Error::invalid_config(format!("{} contains no vector", vector.display()))
+    })?;
+    let new_id = bundle_handle.insert(first.clone())?;
+    bundle_handle.flush()?;
+    println!("inserted id {id}", id = new_id.get());
     Ok(())
 }
 
