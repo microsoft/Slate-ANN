@@ -224,7 +224,10 @@ mod tests {
         let b = [1.0f32, 2.0];
         assert!(matches!(
             l2_sq(&a, &b),
-            Err(Error::DimensionMismatch { expected: 3, got: 2 })
+            Err(Error::DimensionMismatch {
+                expected: 3,
+                got: 2
+            })
         ));
     }
 
@@ -329,11 +332,17 @@ mod tests {
         // f16 stored must be 2*len bytes.
         assert!(matches!(
             distance_f16(Metric::L2, &query, &[0u8; 4]),
-            Err(Error::DimensionMismatch { expected: 6, got: 4 })
+            Err(Error::DimensionMismatch {
+                expected: 6,
+                got: 4
+            })
         ));
         assert!(matches!(
             distance_i8(Metric::L2, &query, 1.0, &[0i8; 2]),
-            Err(Error::DimensionMismatch { expected: 3, got: 2 })
+            Err(Error::DimensionMismatch {
+                expected: 3,
+                got: 2
+            })
         ));
     }
 }
@@ -464,7 +473,11 @@ mod proptests {
             Metric::Cosine => {
                 let (d, nq, ns) = scalar::cosine_parts_f16(query, stored);
                 let denom = (nq * ns).sqrt();
-                if denom == 0.0 { 1.0 } else { 1.0 - d / denom }
+                if denom == 0.0 {
+                    1.0
+                } else {
+                    1.0 - d / denom
+                }
             }
         }
     }
@@ -476,7 +489,11 @@ mod proptests {
             Metric::Cosine => {
                 let (d, nq, ns) = scalar::cosine_parts_i8(query, scale, codes);
                 let denom = (nq * ns).sqrt();
-                if denom == 0.0 { 1.0 } else { 1.0 - d / denom }
+                if denom == 0.0 {
+                    1.0
+                } else {
+                    1.0 - d / denom
+                }
             }
         }
     }
@@ -488,7 +505,11 @@ mod proptests {
 
     /// `Σ(query−stored)²` error scale for the f16/i8 L2 reductions.
     fn l2_scale_decoded(query: &[f32], stored: &[f32]) -> f32 {
-        query.iter().zip(stored).map(|(x, y)| (x - y) * (x - y)).sum()
+        query
+            .iter()
+            .zip(stored)
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum()
     }
 
     proptest! {

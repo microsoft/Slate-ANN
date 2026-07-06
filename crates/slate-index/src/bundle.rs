@@ -216,11 +216,15 @@ impl Bundle {
         if self.updates.is_empty() {
             return self.index.search(&self.store, query, config);
         }
-        self.apply_updates(self.index.search(
-            &self.store,
+        self.apply_updates(
+            self.index.search(
+                &self.store,
+                query,
+                &Self::over_fetch(config, self.updates.tombstones().len()),
+            )?,
             query,
-            &Self::over_fetch(config, self.updates.tombstones().len()),
-        )?, query, config)
+            config,
+        )
     }
 
     /// PQ-gated hybrid search (errors if the index has no PQ tier), with the
@@ -233,11 +237,15 @@ impl Bundle {
         if self.updates.is_empty() {
             return self.index.search_hybrid(&self.store, query, config);
         }
-        self.apply_updates(self.index.search_hybrid(
-            &self.store,
+        self.apply_updates(
+            self.index.search_hybrid(
+                &self.store,
+                query,
+                &Self::over_fetch(config, self.updates.tombstones().len()),
+            )?,
             query,
-            &Self::over_fetch(config, self.updates.tombstones().len()),
-        )?, query, config)
+            config,
+        )
     }
 
     /// Over-fetch by the tombstone count so that, after filtering, at least `k`
@@ -475,7 +483,13 @@ mod tests {
         let dims = 8;
         let vectors = gen_vectors(7, 50, dims);
         let dir = tempfile::tempdir().unwrap();
-        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 1).unwrap();
+        build_bundle(
+            dir.path(),
+            &config_for(dims, IndexBackend::Hnsw),
+            &vectors,
+            1,
+        )
+        .unwrap();
         let present: HashSet<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -490,7 +504,13 @@ mod tests {
         let dims = 8;
         let vectors = gen_vectors(7, 40, dims);
         let dir = tempfile::tempdir().unwrap();
-        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 1).unwrap();
+        build_bundle(
+            dir.path(),
+            &config_for(dims, IndexBackend::Hnsw),
+            &vectors,
+            1,
+        )
+        .unwrap();
 
         // Corrupt the magic field in the manifest.
         let mut manifest = read_manifest(dir.path()).unwrap();
@@ -507,7 +527,13 @@ mod tests {
         let dims = 8;
         let vectors = gen_vectors(7, 40, dims);
         let dir = tempfile::tempdir().unwrap();
-        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 1).unwrap();
+        build_bundle(
+            dir.path(),
+            &config_for(dims, IndexBackend::Hnsw),
+            &vectors,
+            1,
+        )
+        .unwrap();
 
         let mut manifest = read_manifest(dir.path()).unwrap();
         manifest.version = BUNDLE_FORMAT_VERSION + 1;
@@ -527,7 +553,13 @@ mod tests {
         let vectors = vec![vec![0.0f32; 8], vec![0.0f32; 7]];
         let err = build_bundle(dir.path(), &config, &vectors, 1).unwrap_err();
         assert!(
-            matches!(err, Error::DimensionMismatch { expected: 8, got: 7 }),
+            matches!(
+                err,
+                Error::DimensionMismatch {
+                    expected: 8,
+                    got: 7
+                }
+            ),
             "got {err:?}"
         );
     }
@@ -548,7 +580,13 @@ mod tests {
         let dims = 12;
         let vectors = gen_vectors(2024, 200, dims);
         let dir = tempfile::tempdir().unwrap();
-        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 5).unwrap();
+        build_bundle(
+            dir.path(),
+            &config_for(dims, IndexBackend::Hnsw),
+            &vectors,
+            5,
+        )
+        .unwrap();
         let bundle = open_bundle(dir.path()).unwrap();
         assert!(bundle.updates().is_empty());
 
@@ -567,7 +605,13 @@ mod tests {
         let dims = 12;
         let vectors = gen_vectors(2024, 200, dims);
         let dir = tempfile::tempdir().unwrap();
-        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 5).unwrap();
+        build_bundle(
+            dir.path(),
+            &config_for(dims, IndexBackend::Hnsw),
+            &vectors,
+            5,
+        )
+        .unwrap();
         let mut bundle = open_bundle(dir.path()).unwrap();
 
         // Query a stored vector by re-using it: top hit is itself (score 0).
@@ -589,7 +633,13 @@ mod tests {
         let dims = 12;
         let vectors = gen_vectors(2024, 200, dims);
         let dir = tempfile::tempdir().unwrap();
-        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 5).unwrap();
+        build_bundle(
+            dir.path(),
+            &config_for(dims, IndexBackend::Hnsw),
+            &vectors,
+            5,
+        )
+        .unwrap();
         let mut bundle = open_bundle(dir.path()).unwrap();
         let base_len = bundle.store().len() as u64;
 
@@ -608,11 +658,23 @@ mod tests {
         let dims = 8;
         let vectors = gen_vectors(7, 40, dims);
         let dir = tempfile::tempdir().unwrap();
-        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 1).unwrap();
+        build_bundle(
+            dir.path(),
+            &config_for(dims, IndexBackend::Hnsw),
+            &vectors,
+            1,
+        )
+        .unwrap();
         let mut bundle = open_bundle(dir.path()).unwrap();
         let err = bundle.insert(vec![0.0f32; 7]).unwrap_err();
         assert!(
-            matches!(err, Error::DimensionMismatch { expected: 8, got: 7 }),
+            matches!(
+                err,
+                Error::DimensionMismatch {
+                    expected: 8,
+                    got: 7
+                }
+            ),
             "got {err:?}"
         );
     }
@@ -622,7 +684,13 @@ mod tests {
         let dims = 12;
         let vectors = gen_vectors(2024, 200, dims);
         let dir = tempfile::tempdir().unwrap();
-        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 5).unwrap();
+        build_bundle(
+            dir.path(),
+            &config_for(dims, IndexBackend::Hnsw),
+            &vectors,
+            5,
+        )
+        .unwrap();
         let mut bundle = open_bundle(dir.path()).unwrap();
 
         let newcomer: Vec<f32> = (0..dims).map(|j| 100.0 + j as f32).collect();
@@ -638,7 +706,13 @@ mod tests {
         let dims = 12;
         let vectors = gen_vectors(2024, 200, dims);
         let dir = tempfile::tempdir().unwrap();
-        build_bundle(dir.path(), &config_for(dims, IndexBackend::Hnsw), &vectors, 5).unwrap();
+        build_bundle(
+            dir.path(),
+            &config_for(dims, IndexBackend::Hnsw),
+            &vectors,
+            5,
+        )
+        .unwrap();
 
         let newcomer: Vec<f32> = (0..dims).map(|j| 100.0 + j as f32).collect();
         let new_id;

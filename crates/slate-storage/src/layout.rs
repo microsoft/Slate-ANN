@@ -376,7 +376,13 @@ mod tests {
             block_cursor: 0,
         };
         let err = w.push(&[1.0, 2.0, 3.0]).unwrap_err();
-        assert!(matches!(err, Error::DimensionMismatch { expected: 4, got: 3 }));
+        assert!(matches!(
+            err,
+            Error::DimensionMismatch {
+                expected: 4,
+                got: 3
+            }
+        ));
     }
 
     #[test]

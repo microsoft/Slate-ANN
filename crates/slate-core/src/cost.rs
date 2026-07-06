@@ -267,11 +267,7 @@ impl QueryCost {
     /// strictly lower at equal bytes, which is the behaviour the paradigm
     /// predicts and the scheduler is built to produce.
     #[inline]
-    pub fn estimate(
-        counters: &QueryCounters,
-        profile: StorageProfile,
-        cost: DistanceCost,
-    ) -> Self {
+    pub fn estimate(counters: &QueryCounters, profile: StorageProfile, cost: DistanceCost) -> Self {
         let traversal_s = counters.nodes_visited as f64 * Self::HOP_OVERHEAD_S;
         let storage_access_s = counters.seeks as f64 * profile.seek_latency_s
             + profile.transfer_s(counters.bytes_read);
@@ -393,10 +389,9 @@ mod tests {
         assert_eq!(qc.distance_s, 1000.0 * 5e-9 + 50.0 * 200e-9);
         // 50 random seeks on HDD ≈ 50 * 9 ms = 0.45 s, the dominant term.
         assert!(qc.storage_access_s > 0.4);
-        assert!((qc.total_s()
-            - (qc.traversal_s + qc.storage_access_s + qc.distance_s))
-            .abs()
-            < 1e-12);
+        assert!(
+            (qc.total_s() - (qc.traversal_s + qc.storage_access_s + qc.distance_s)).abs() < 1e-12
+        );
     }
 
     #[test]

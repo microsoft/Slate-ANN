@@ -57,12 +57,7 @@ fn build_then_query_returns_nearest_first() {
     assert_eq!(lines.len(), 3, "expected k=3 result lines, got: {stdout:?}");
 
     // First column of the first line is the nearest neighbour's id == 2.
-    let nearest_id: u64 = lines[0]
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let nearest_id: u64 = lines[0].split_whitespace().next().unwrap().parse().unwrap();
     assert_eq!(nearest_id, 2, "nearest neighbour should be the exact match");
 }
 
@@ -128,9 +123,18 @@ fn bench_reports_cost_and_recall() {
     assert!(bench.status.success(), "`slate bench` failed");
 
     let stdout = String::from_utf8(bench.stdout).unwrap();
-    assert!(stdout.contains("bench: 2 queries"), "report header: {stdout:?}");
-    assert!(stdout.contains("storage_fraction"), "missing cost model: {stdout:?}");
-    assert!(stdout.contains("recall@3"), "missing recall line: {stdout:?}");
+    assert!(
+        stdout.contains("bench: 2 queries"),
+        "report header: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("storage_fraction"),
+        "missing cost model: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("recall@3"),
+        "missing recall line: {stdout:?}"
+    );
 }
 
 #[test]
@@ -151,8 +155,14 @@ fn bench_without_recall_omits_recall_line() {
     assert!(bench.status.success(), "`slate bench` failed");
 
     let stdout = String::from_utf8(bench.stdout).unwrap();
-    assert!(stdout.contains("profile=ssd"), "profile not echoed: {stdout:?}");
-    assert!(!stdout.contains("recall@"), "recall should be omitted: {stdout:?}");
+    assert!(
+        stdout.contains("profile=ssd"),
+        "profile not echoed: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("recall@"),
+        "recall should be omitted: {stdout:?}"
+    );
 }
 
 #[test]
@@ -206,7 +216,10 @@ fn insert_adds_a_new_vector() {
     assert!(insert.status.success(), "`slate insert` failed");
     let insert_out = String::from_utf8(insert.stdout).unwrap();
     // Five stored vectors -> the buffered insert takes id 5.
-    assert!(insert_out.contains("inserted id 5"), "insert id: {insert_out:?}");
+    assert!(
+        insert_out.contains("inserted id 5"),
+        "insert id: {insert_out:?}"
+    );
 
     let query_path = dir.path().join("query.txt");
     fs::write(&query_path, "7 7 7 7\n").unwrap();
@@ -228,5 +241,8 @@ fn insert_adds_a_new_vector() {
         .split_whitespace()
         .next()
         .unwrap();
-    assert_eq!(nearest_id, "5", "inserted vector should be nearest: {stdout:?}");
+    assert_eq!(
+        nearest_id, "5",
+        "inserted vector should be nearest: {stdout:?}"
+    );
 }

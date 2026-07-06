@@ -304,8 +304,7 @@ impl IvfIndex {
         counters.add_approx(self.num_lists as u64);
         // Partial-select the `probes` smallest by distance (ties by list id for
         // determinism).
-        centroid_scores
-            .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        centroid_scores.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         centroid_scores.truncate(probes);
 
         // ---- CANDIDATES: union the probed posting lists, deduped. Sorting the
@@ -392,8 +391,7 @@ impl IvfIndex {
             centroid_scores.push((d, c));
         }
         counters.add_approx(self.num_lists as u64);
-        centroid_scores
-            .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        centroid_scores.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         centroid_scores.truncate(probes);
 
         // ---- CANDIDATES: union + dedup the probed posting lists (ascending ids).
@@ -464,9 +462,9 @@ fn nearest_centroids(
 
 #[cfg(test)]
 mod tests {
-        use super::*;
-        use crate::rng::SplitMix64;
-        use slate_core::{Dtype, PqParams, StorageParams};
+    use super::*;
+    use crate::rng::SplitMix64;
+    use slate_core::{Dtype, PqParams, StorageParams};
     use slate_storage::{Advice, BlockLayout, MmapBackend, StoreWriter};
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -474,10 +472,7 @@ mod tests {
 
     /// Write `vectors` (row-major, `dims` each) to a temp store and open it
     /// mmap-backed, using the default (large) block size.
-    fn build_store(
-        vectors: &[Vec<f32>],
-        dims: usize,
-    ) -> (NamedTempFile, VectorStore<MmapBackend>) {
+    fn build_store(vectors: &[Vec<f32>], dims: usize) -> (NamedTempFile, VectorStore<MmapBackend>) {
         build_store_blocked(vectors, dims, StorageParams::default().block_size)
     }
 
@@ -782,8 +777,9 @@ mod tests {
             total_runs += stats.counters.sequential_runs;
             total_candidates += stats.counters.exact_distances;
 
-            let truth: HashSet<u64> =
-                naive_knn(&vectors, &query, Metric::L2, 10).into_iter().collect();
+            let truth: HashSet<u64> = naive_knn(&vectors, &query, Metric::L2, 10)
+                .into_iter()
+                .collect();
             let hits = res.iter().filter(|n| truth.contains(&n.id.get())).count();
             total_recall += hits as f64 / 10.0;
         }
@@ -827,8 +823,9 @@ mod tests {
         for _ in 0..queries {
             let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32 * 10.0).collect();
             let (res, _stats) = index.search_hybrid(store, &query, &cfg).unwrap();
-            let truth: HashSet<u64> =
-                naive_knn(vectors, &query, Metric::L2, k).into_iter().collect();
+            let truth: HashSet<u64> = naive_knn(vectors, &query, Metric::L2, k)
+                .into_iter()
+                .collect();
             let hits = res.iter().filter(|n| truth.contains(&n.id.get())).count();
             total += hits as f64 / k as f64;
         }
@@ -848,7 +845,10 @@ mod tests {
             IvfIndex::build_with_pq(&store, Metric::L2, &ivf_params(16, 8, 2), &ivf_pq(), 555)
                 .unwrap();
         let recall = mean_recall_hybrid(&index, &store, &vectors, 10, 30, 7);
-        assert!(recall >= 0.70, "hybrid recall@10 {recall:.3} below floor 0.70");
+        assert!(
+            recall >= 0.70,
+            "hybrid recall@10 {recall:.3} below floor 0.70"
+        );
     }
 
     #[test]
@@ -861,8 +861,7 @@ mod tests {
         let (_tmp, store) = build_store(&vectors, dims);
         let params = ivf_params(16, 8, 2);
         let plain = IvfIndex::build(&store, Metric::L2, &params, 555).unwrap();
-        let hybrid =
-            IvfIndex::build_with_pq(&store, Metric::L2, &params, &ivf_pq(), 555).unwrap();
+        let hybrid = IvfIndex::build_with_pq(&store, Metric::L2, &params, &ivf_pq(), 555).unwrap();
 
         let cfg = SearchConfig {
             k: 10,
@@ -904,10 +903,7 @@ mod tests {
         let err = index.search_hybrid(&store, &query, &cfg).unwrap_err();
         match err {
             Error::Unsupported(msg) => {
-                assert!(
-                    msg.contains("build_with_pq"),
-                    "unexpected message: {msg}"
-                );
+                assert!(msg.contains("build_with_pq"), "unexpected message: {msg}");
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }

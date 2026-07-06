@@ -161,9 +161,9 @@ fn run_query(bundle: &Path, query: &Path, k: usize) -> Result<()> {
     let expected = index.config().dimensions;
 
     let (dims, rows) = read_vectors_text(query)?;
-    let first = rows.first().ok_or_else(|| {
-        Error::invalid_config(format!("query file {} is empty", query.display()))
-    })?;
+    let first = rows
+        .first()
+        .ok_or_else(|| Error::invalid_config(format!("query file {} is empty", query.display())))?;
     if dims != expected {
         return Err(Error::DimensionMismatch {
             expected,
@@ -255,7 +255,10 @@ fn run_bench(bundle: &Path, queries: &Path, k: usize, profile: &str, recall: boo
     );
     println!("  measured mean latency: {measured_ms:.4} ms/query");
     println!("  mean counters per query:");
-    println!("    nodes_visited:    {:.1}", total.nodes_visited as f64 / n);
+    println!(
+        "    nodes_visited:    {:.1}",
+        total.nodes_visited as f64 / n
+    );
     println!(
         "    approx_distances: {:.1}",
         total.approx_distances as f64 / n
@@ -307,9 +310,9 @@ fn run_delete(bundle: &Path, id: u64) -> Result<()> {
 fn run_insert(bundle: &Path, vector: &Path) -> Result<()> {
     let mut bundle_handle = slate_index::open_bundle(bundle)?;
     let (_dims, rows) = read_vectors_text(vector)?;
-    let first = rows.first().ok_or_else(|| {
-        Error::invalid_config(format!("{} contains no vector", vector.display()))
-    })?;
+    let first = rows
+        .first()
+        .ok_or_else(|| Error::invalid_config(format!("{} contains no vector", vector.display())))?;
     let new_id = bundle_handle.insert(first.clone())?;
     bundle_handle.flush()?;
     println!("inserted id {id}", id = new_id.get());
@@ -353,9 +356,8 @@ fn read_vectors_text(path: &Path) -> Result<(usize, Vec<Vec<f32>>)> {
         rows.push(row);
     }
 
-    let dims = dims.ok_or_else(|| {
-        Error::invalid_config(format!("{} contains no vectors", path.display()))
-    })?;
+    let dims = dims
+        .ok_or_else(|| Error::invalid_config(format!("{} contains no vectors", path.display())))?;
     Ok((dims, rows))
 }
 

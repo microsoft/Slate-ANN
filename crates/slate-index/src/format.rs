@@ -109,7 +109,9 @@ fn parse_frame(bytes: &[u8]) -> Result<(BackendTag, &[u8])> {
         )));
     }
     if bytes[0..8] != MAGIC {
-        return Err(Error::corrupt("bad index magic (not a Slate-ANN index file)"));
+        return Err(Error::corrupt(
+            "bad index magic (not a Slate-ANN index file)",
+        ));
     }
     let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
     if version != FORMAT_VERSION {
@@ -221,10 +223,7 @@ mod tests {
             .collect()
     }
 
-    fn build_store(
-        vectors: &[Vec<f32>],
-        dims: usize,
-    ) -> (NamedTempFile, VectorStore<MmapBackend>) {
+    fn build_store(vectors: &[Vec<f32>], dims: usize) -> (NamedTempFile, VectorStore<MmapBackend>) {
         let tmp = NamedTempFile::new().unwrap();
         let block_size = StorageParams::default().block_size;
         let layout = BlockLayout::new(Dtype::F32, dims, block_size).unwrap();
@@ -303,8 +302,7 @@ mod tests {
         for q in &queries {
             let (orig_res, orig_stats): (_, IvfStats) =
                 original.search(&store, q, &cfg(10)).unwrap();
-            let (load_res, load_stats): (_, IvfStats) =
-                loaded.search(&store, q, &cfg(10)).unwrap();
+            let (load_res, load_stats): (_, IvfStats) = loaded.search(&store, q, &cfg(10)).unwrap();
             let orig_ids: Vec<_> = orig_res.iter().map(|n| n.id).collect();
             let load_ids: Vec<_> = load_res.iter().map(|n| n.id).collect();
             assert_eq!(orig_ids, load_ids, "loaded IVF search ids differ");
@@ -370,7 +368,10 @@ mod tests {
         let mut buf = Vec::new();
         write_hnsw(&mut buf, &hnsw).unwrap();
         let err = read_ivf(&buf).unwrap_err();
-        assert!(matches!(err, Error::Corrupt(_)), "expected corrupt, got {err:?}");
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "expected corrupt, got {err:?}"
+        );
         assert!(err.to_string().contains("backend mismatch"));
     }
 

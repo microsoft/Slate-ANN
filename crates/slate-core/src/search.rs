@@ -42,9 +42,7 @@ impl Neighbor {
 #[inline]
 #[must_use]
 pub fn cmp_ascending(a: &Neighbor, b: &Neighbor) -> core::cmp::Ordering {
-    a.score
-        .total_cmp(&b.score)
-        .then_with(|| a.id.cmp(&b.id))
+    a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id))
 }
 
 /// Wrapper giving [`Neighbor`] a total `Ord` via [`cmp_ascending`].

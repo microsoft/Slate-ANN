@@ -83,9 +83,7 @@
 //! [`write_reordered_store`] rewrites the backing store in the new order so the
 //! relabeled ids again match their rows.
 
-use slate_core::{
-    Error, Metric, Neighbor, QueryCounters, Result, SearchConfig, TopK, VectorId,
-};
+use slate_core::{Error, Metric, Neighbor, QueryCounters, Result, SearchConfig, TopK, VectorId};
 use slate_storage::{BlockLayout, IoBackend, StoreWriter, VectorStore};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
@@ -392,9 +390,7 @@ impl HnswIndex {
 
             // Build the subgraph. A per-shard seed keeps the whole build
             // deterministic yet decorrelates shard insertion orders.
-            let shard_seed = seed
-                .wrapping_mul(SHARD_SEED_STRIDE)
-                .wrapping_add(s as u64);
+            let shard_seed = seed.wrapping_mul(SHARD_SEED_STRIDE).wrapping_add(s as u64);
             let sub = Self::build_resident(
                 shard_data,
                 dims,
@@ -650,10 +646,7 @@ impl HnswIndex {
 
         // Visit BFS roots in this order: the entry point first, then every node
         // in ascending id as a fallback for disconnected components.
-        let roots = self
-            .entry_point
-            .into_iter()
-            .chain(0..n as u32);
+        let roots = self.entry_point.into_iter().chain(0..n as u32);
 
         for root in roots {
             if visited[root as usize] {
@@ -721,8 +714,7 @@ impl HnswIndex {
         for layer in &self.adjacency {
             let mut new_layer = vec![Vec::new(); n];
             for (old, neighbors) in layer.iter().enumerate() {
-                let mut remapped: Vec<u32> =
-                    neighbors.iter().map(|&w| pos[w as usize]).collect();
+                let mut remapped: Vec<u32> = neighbors.iter().map(|&w| pos[w as usize]).collect();
                 // Neighbour order within a list is not semantically meaningful,
                 // but sorting keeps relabel deterministic and diff-friendly.
                 remapped.sort_unstable();
@@ -837,8 +829,13 @@ impl HnswIndex {
         // ef_construction search and connect.
         let mut entry_points = vec![current];
         for layer in (0..=level).rev() {
-            let candidates =
-                self.search_layer(query, &entry_points, self.params.ef_construction, layer, data)?;
+            let candidates = self.search_layer(
+                query,
+                &entry_points,
+                self.params.ef_construction,
+                layer,
+                data,
+            )?;
 
             let cap = self.params.cap_for_layer(layer);
             let selected = select_neighbors(&candidates, cap);
@@ -936,8 +933,14 @@ impl HnswIndex {
                 let d = self.dist_ram(query, nbr, data)?;
                 let worst_score = results.peek().map(|r| r.score);
                 if results.len() < ef || worst_score.is_none_or(|w| d < w) {
-                    frontier.push(Candidate { node: nbr, score: d });
-                    results.push(ResultEntry { node: nbr, score: d });
+                    frontier.push(Candidate {
+                        node: nbr,
+                        score: d,
+                    });
+                    results.push(ResultEntry {
+                        node: nbr,
+                        score: d,
+                    });
                     if results.len() > ef {
                         results.pop();
                     }
@@ -984,7 +987,10 @@ impl HnswIndex {
         let mut scored: Vec<Candidate> = Vec::with_capacity(neighbors.len());
         for &nbr in &neighbors {
             let d = self.dist_ram(query, nbr, data)?;
-            scored.push(Candidate { node: nbr, score: d });
+            scored.push(Candidate {
+                node: nbr,
+                score: d,
+            });
         }
         let kept = select_neighbors(&scored, cap);
         self.adjacency[layer][node as usize] = kept;
@@ -1133,8 +1139,14 @@ impl HnswIndex {
         // Descend the upper layers greedily (beam width 1) to find a good entry
         // into layer 0.
         let mut current = entry;
-        let mut current_dist =
-            self.dist_disk(store, query, current, &mut scratch, &mut counters, vector_bytes)?;
+        let mut current_dist = self.dist_disk(
+            store,
+            query,
+            current,
+            &mut scratch,
+            &mut counters,
+            vector_bytes,
+        )?;
         let mut layer = self.max_layer;
         while layer > 0 {
             let mut improved = true;
@@ -1162,8 +1174,15 @@ impl HnswIndex {
 
         // Width-ef_search best-first search on layer 0.
         let ef = config.ef_search.max(config.k).max(1);
-        let results =
-            self.search_layer_disk(store, query, current, ef, &mut scratch, &mut counters, vector_bytes)?;
+        let results = self.search_layer_disk(
+            store,
+            query,
+            current,
+            ef,
+            &mut scratch,
+            &mut counters,
+            vector_bytes,
+        )?;
 
         // Collect the best k.
         let mut topk = TopK::new(config.k);
@@ -1241,8 +1260,14 @@ impl HnswIndex {
                 let d = self.dist_disk(store, query, nbr, scratch, counters, vector_bytes)?;
                 let worst_score = results.peek().map(|r| r.score);
                 if results.len() < ef || worst_score.is_none_or(|w| d < w) {
-                    frontier.push(Candidate { node: nbr, score: d });
-                    results.push(ResultEntry { node: nbr, score: d });
+                    frontier.push(Candidate {
+                        node: nbr,
+                        score: d,
+                    });
+                    results.push(ResultEntry {
+                        node: nbr,
+                        score: d,
+                    });
                     if results.len() > ef {
                         results.pop();
                     }
@@ -1341,15 +1366,8 @@ impl HnswIndex {
 
         // Layer 0: PQ-gated interleaved beam.
         let ef = config.ef_search.max(config.k).max(1);
-        let results = self.search_layer_hybrid(
-            store,
-            query,
-            &adc,
-            current,
-            ef,
-            config,
-            &mut counters,
-        )?;
+        let results =
+            self.search_layer_hybrid(store, query, &adc, current, ef, config, &mut counters)?;
 
         let mut topk = TopK::new(config.k);
         for c in results {
@@ -1485,7 +1503,10 @@ impl HnswIndex {
                         }
                         discovered[nbr as usize] = true;
                         let a = self.approx_dist(adc, nbr, counters)?;
-                        approx_pq.push(Candidate { node: nbr, score: a });
+                        approx_pq.push(Candidate {
+                            node: nbr,
+                            score: a,
+                        });
                     }
                 } else {
                     // The exact frontier can no longer improve the results; the
@@ -1698,8 +1719,9 @@ mod tests {
     #[test]
     fn hybrid_empty_graph_returns_empty() {
         let (_tmp, store) = build_store(&[], 4);
-        let index = HnswIndex::build_with_pq(&store, Metric::L2, &default_params(), &hybrid_pq(), 1)
-            .unwrap();
+        let index =
+            HnswIndex::build_with_pq(&store, Metric::L2, &default_params(), &hybrid_pq(), 1)
+                .unwrap();
         assert!(!index.has_pq(), "empty store has nothing to quantize");
         let cfg = SearchConfig::default();
         let (res, stats) = index
@@ -1713,8 +1735,9 @@ mod tests {
     fn hybrid_single_vector_is_its_own_nearest() {
         let vectors = vec![vec![1.0, 2.0, 3.0, 4.0]];
         let (_tmp, store) = build_store(&vectors, 4);
-        let index = HnswIndex::build_with_pq(&store, Metric::L2, &default_params(), &hybrid_pq(), 7)
-            .unwrap();
+        let index =
+            HnswIndex::build_with_pq(&store, Metric::L2, &default_params(), &hybrid_pq(), 7)
+                .unwrap();
         assert!(index.has_pq());
         let cfg = SearchConfig {
             k: 1,
@@ -1764,10 +1787,7 @@ mod tests {
             let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
             let (res, stats) = index.search_hybrid(&store, &query, &cfg).unwrap();
             let truth = naive_knn(&vectors, &query, Metric::L2, k);
-            let hits = res
-                .iter()
-                .filter(|nb| truth.contains(&nb.id.get()))
-                .count();
+            let hits = res.iter().filter(|nb| truth.contains(&nb.id.get())).count();
             total_recall += hits as f64 / k as f64;
 
             // Approximate distances must be recorded (the new cost term), and we
@@ -1836,10 +1856,7 @@ mod tests {
     /// Build one f32 and one narrow store from the SAME vectors, run hybrid
     /// search over both, and return (f32_total_bytes, narrow_total_bytes,
     /// narrow_mean_recall). Truth is computed on the original f32 vectors.
-    fn narrow_vs_f32(
-        dtype: Dtype,
-        block_size: usize,
-    ) -> (u64, u64, f64) {
+    fn narrow_vs_f32(dtype: Dtype, block_size: usize) -> (u64, u64, f64) {
         let mut rng = SplitMix64::new(2025);
         let dims = 16;
         let n = 400;
@@ -1911,7 +1928,10 @@ mod tests {
     #[test]
     fn hybrid_on_i8_store_keeps_recall_and_cuts_bytes() {
         let (f32_bytes, i8_bytes, recall) = narrow_vs_f32(Dtype::I8, 256);
-        assert!(i8_bytes < f32_bytes, "i8 bytes {i8_bytes} !< f32 {f32_bytes}");
+        assert!(
+            i8_bytes < f32_bytes,
+            "i8 bytes {i8_bytes} !< f32 {f32_bytes}"
+        );
         // i8 is lossier than f16 but still retains strong recall on this data.
         assert!(recall >= 0.65, "i8 recall too low: {recall:.3}");
     }
@@ -1976,10 +1996,7 @@ mod tests {
             }
 
             let truth = naive_knn(&vectors, &query, Metric::L2, k);
-            let hits = res
-                .iter()
-                .filter(|nb| truth.contains(&nb.id.get()))
-                .count();
+            let hits = res.iter().filter(|nb| truth.contains(&nb.id.get())).count();
             total_recall += hits as f64 / k as f64;
         }
         let mean_recall = total_recall / queries as f64;
@@ -2031,10 +2048,7 @@ mod tests {
             total_exact += c.exact_distances;
 
             let truth = naive_knn(&vectors, &query, Metric::L2, k);
-            let hits = res
-                .iter()
-                .filter(|nb| truth.contains(&nb.id.get()))
-                .count();
+            let hits = res.iter().filter(|nb| truth.contains(&nb.id.get())).count();
             total_recall += hits as f64 / k as f64;
         }
         // Coalescing must save seeks in aggregate: strictly fewer seeks than
@@ -2219,7 +2233,8 @@ mod tests {
             .collect();
         let (_tmp, store) = build_store(&vectors, dims);
         let index =
-            HnswIndex::build_with_pq(&store, Metric::L2, &default_params(), &hybrid_pq(), 9).unwrap();
+            HnswIndex::build_with_pq(&store, Metric::L2, &default_params(), &hybrid_pq(), 9)
+                .unwrap();
         let cfg = SearchConfig {
             k: 10,
             ef_search: 48,
@@ -2345,7 +2360,10 @@ mod tests {
             let (res, _stats) = index.search(&store, &query, &cfg).unwrap();
             let truth = naive_knn(&vectors, &query, Metric::L2, k);
             let truth_set: std::collections::HashSet<u64> = truth.into_iter().collect();
-            let hits = res.iter().filter(|n| truth_set.contains(&n.id.get())).count();
+            let hits = res
+                .iter()
+                .filter(|n| truth_set.contains(&n.id.get()))
+                .count();
             total_recall += hits as f64 / k as f64;
         }
         let mean_recall = total_recall / f64::from(queries);
@@ -2388,8 +2406,9 @@ mod tests {
         for _ in 0..queries {
             let query: Vec<f32> = (0..dims).map(|_| rng.next_f64() as f32).collect();
             let (res, _stats) = index.search(store, &query, &cfg).unwrap();
-            let truth: std::collections::HashSet<u64> =
-                naive_knn(vectors, &query, Metric::L2, k).into_iter().collect();
+            let truth: std::collections::HashSet<u64> = naive_knn(vectors, &query, Metric::L2, k)
+                .into_iter()
+                .collect();
             let hits = res.iter().filter(|n| truth.contains(&n.id.get())).count();
             total += hits as f64 / k as f64;
         }
@@ -2409,8 +2428,7 @@ mod tests {
             ..HnswParams::default()
         };
 
-        let sharded =
-            HnswIndex::build_sharded(&store, Metric::L2, &params, 4, 2, 777).unwrap();
+        let sharded = HnswIndex::build_sharded(&store, Metric::L2, &params, 4, 2, 777).unwrap();
         assert_eq!(sharded.len(), n);
         assert!(!sharded.has_pq(), "sharded build produces a PQ-less graph");
 
@@ -2437,8 +2455,7 @@ mod tests {
         // num_shards <= 1 must fall back to the monolithic builder with the same
         // seed, producing a byte-identical graph.
         let mono = HnswIndex::build(&store, Metric::L2, &params, 555).unwrap();
-        let sharded =
-            HnswIndex::build_sharded(&store, Metric::L2, &params, 1, 2, 555).unwrap();
+        let sharded = HnswIndex::build_sharded(&store, Metric::L2, &params, 1, 2, 555).unwrap();
 
         assert_eq!(sharded.len(), mono.len());
         assert_eq!(sharded.edge_count(0), mono.edge_count(0));
@@ -2472,8 +2489,7 @@ mod tests {
             ..HnswParams::default()
         };
 
-        let sharded =
-            HnswIndex::build_sharded(&store, Metric::L2, &params, 6, 2, 4242).unwrap();
+        let sharded = HnswIndex::build_sharded(&store, Metric::L2, &params, 6, 2, 4242).unwrap();
         // The merge unions out-edges across shards, then re-caps. No node may
         // exceed the layer cap (m_max on layer 0).
         for layer in 0..=sharded.max_layer() {
@@ -2613,7 +2629,10 @@ mod tests {
             let (res, _stats) = index.search(&store, &query, &cfg).unwrap();
             let truth = naive_knn(&vectors, &query, Metric::L2, k);
             let truth_set: std::collections::HashSet<u64> = truth.into_iter().collect();
-            let hits = res.iter().filter(|n| truth_set.contains(&n.id.get())).count();
+            let hits = res
+                .iter()
+                .filter(|n| truth_set.contains(&n.id.get()))
+                .count();
             total_recall += hits as f64 / k as f64;
         }
         let mean_recall = total_recall / f64::from(queries);
@@ -2704,9 +2723,9 @@ mod tests {
                 .unwrap();
 
         // Re-open the same file behind a read-counting backend.
-        let counting = VectorStore::with_backend(
-            CountingBackend::new(slate_storage::MmapBackend::open(tmp.path()).unwrap()),
-        )
+        let counting = VectorStore::with_backend(CountingBackend::new(
+            slate_storage::MmapBackend::open(tmp.path()).unwrap(),
+        ))
         .unwrap();
 
         let k = 10;

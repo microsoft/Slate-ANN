@@ -273,12 +273,17 @@ impl<B: IoBackend> VectorStore<B> {
             let (offset, len) = self.layout.run_span(first, last);
             // Pre-fault the run the elevator is about to stream; the map is
             // otherwise left `Random` (set by the caller before traversal).
-            let _ = self
-                .backend
-                .advise_range(offset, len, Advice::WillNeed);
+            let _ = self.backend.advise_range(offset, len, Advice::WillNeed);
             // Scatter the contiguous run directly into per-slot buffers (gaps go
             // to a throwaway sink), eliminating the run_buf -> slot copy.
-            self.scatter_run(&order[start..start + count], offset, len, vbytes, &mut slot_bufs, &mut sink)?;
+            self.scatter_run(
+                &order[start..start + count],
+                offset,
+                len,
+                vbytes,
+                &mut slot_bufs,
+                &mut sink,
+            )?;
             // Decode each wanted slot straight out of its tight buffer.
             for (i, &index) in order[start..start + count].iter().enumerate() {
                 let slot = &slot_bufs[i * vbytes..(i + 1) * vbytes];
@@ -393,7 +398,14 @@ impl<B: IoBackend> VectorStore<B> {
             let last = order[start + count - 1];
             let (offset, len) = self.layout.run_span(first, last);
             let _ = self.backend.advise_range(offset, len, Advice::WillNeed);
-            self.scatter_run(&order[start..start + count], offset, len, vbytes, &mut slot_bufs, &mut sink)?;
+            self.scatter_run(
+                &order[start..start + count],
+                offset,
+                len,
+                vbytes,
+                &mut slot_bufs,
+                &mut sink,
+            )?;
             for (i, &index) in order[start..start + count].iter().enumerate() {
                 let slot = &slot_bufs[i * vbytes..(i + 1) * vbytes];
                 let dist = match dtype {
@@ -452,7 +464,11 @@ mod tests {
 
     /// Write `count` deterministic vectors of `dims` dims into a temp file and
     /// return the path (kept alive by the returned `TempDir`).
-    fn write_store(dims: usize, block_size: usize, count: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+    fn write_store(
+        dims: usize,
+        block_size: usize,
+        count: usize,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vectors.bin");
         let layout = BlockLayout::new(Dtype::F32, dims, block_size).unwrap();
@@ -509,7 +525,10 @@ mod tests {
         let mut buf = [0.0f32; 7];
         assert!(matches!(
             store.get_into(0, &mut buf),
-            Err(Error::DimensionMismatch { expected: 8, got: 7 })
+            Err(Error::DimensionMismatch {
+                expected: 8,
+                got: 7
+            })
         ));
     }
 
@@ -659,7 +678,10 @@ mod tests {
         let mut scratch = Vec::new();
         assert!(matches!(
             store.get_into_scratch(0, &mut buf, &mut scratch),
-            Err(Error::DimensionMismatch { expected: 8, got: 7 })
+            Err(Error::DimensionMismatch {
+                expected: 8,
+                got: 7
+            })
         ));
     }
 }

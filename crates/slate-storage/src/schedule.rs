@@ -298,7 +298,10 @@ mod tests {
         let (offset, len) = layout.run_span(first, last);
         assert_eq!(offset, layout.vector_offset(5));
         // 3 one-vector blocks => span covers 3 whole blocks worth of bytes.
-        assert_eq!(len, layout.vector_offset(7) + layout.vector_bytes() as usize - layout.vector_offset(5));
+        assert_eq!(
+            len,
+            layout.vector_offset(7) + layout.vector_bytes() - layout.vector_offset(5)
+        );
     }
 
     #[test]
@@ -321,9 +324,9 @@ mod tests {
         // it is exactly payload (each block is one slot). Use a layout with
         // spare room per block so padding actually appears.
         let layout = BlockLayout::new(Dtype::F32, 4, 64).unwrap(); // 16B vec, 4/block
-        // Indices 0 and 4 live in blocks 0 and 1 (adjacent) => one run. The
-        // executor streams from slot 0 of block 0 through slot 0 of block 1,
-        // i.e. across block 0's three trailing slots of padding.
+                                                                   // Indices 0 and 4 live in blocks 0 and 1 (adjacent) => one run. The
+                                                                   // executor streams from slot 0 of block 0 through slot 0 of block 1,
+                                                                   // i.e. across block 0's three trailing slots of padding.
         let plan = FetchSchedule::plan(&layout, &[0, 4]);
         assert_eq!(plan.runs(), 1);
         assert!(plan.span_bytes() > plan.bytes());
