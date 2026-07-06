@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use Slate-ANN, please cite this software."
+type: software
+title: "Slate-ANN"
+abstract: "Slate-ANN is a high-performance, disk-backed approximate nearest-neighbor search engine for storage-aware vector retrieval."
+authors:
+  - family-names: "Ganesh"
+    given-names: "Anirudh"
+    affiliation: "Microsoft"
+repository-code: "https://github.com/microsoft/Slate-ANN"
+url: "https://github.com/microsoft/Slate-ANN"
+license: "MIT OR Apache-2.0"
+version: "0.0.1"
+date-released: "2026-07-05"
+keywords:
+  - "approximate nearest neighbor"
+  - "vector search"
+  - "storage-aware search"
+  - "disk-backed search"
+  - "Rust"
