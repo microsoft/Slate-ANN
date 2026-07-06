@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: crates-io-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish-crates:
+    name: Publish crates.io packages
+    runs-on: ubuntu-latest
+    environment: crates-io
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Use Rust
+        run: rustup default stable
+
+      - name: Show Rust versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Verify release tag matches crate version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "slate-core"))')
+          tag_version=${RELEASE_TAG#v}
+          if [ "$tag_version" != "$version" ]; then
+            echo "Release tag '$RELEASE_TAG' does not match workspace crate version '$version'."
+            exit 1
+          fi
+
+      - name: Package workspace
+        run: cargo package --workspace --locked
+
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish workspace
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --workspace --locked

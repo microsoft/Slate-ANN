@@ -22,12 +22,12 @@ authors = ["Slate-ANN contributors"]
 # `dep = { workspace = true }` so versions stay consistent workspace-wide.
 [workspace.dependencies]
 # Internal crates
-slate-core = { path = "crates/slate-core" }
-slate-simd = { path = "crates/slate-simd" }
-slate-storage = { path = "crates/slate-storage" }
-slate-pq = { path = "crates/slate-pq" }
-slate-graph = { path = "crates/slate-graph" }
-slate-index = { path = "crates/slate-index" }
+slate-core = { path = "crates/slate-core", version = "0.0.1" }
+slate-simd = { path = "crates/slate-simd", version = "0.0.1" }
+slate-storage = { path = "crates/slate-storage", version = "0.0.1" }
+slate-pq = { path = "crates/slate-pq", version = "0.0.1" }
+slate-graph = { path = "crates/slate-graph", version = "0.0.1" }
+slate-index = { path = "crates/slate-index", version = "0.0.1" }
 
 # External
 thiserror = "2"

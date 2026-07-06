@@ -26,7 +26,7 @@ The engine is built around storage-aware search: query latency is modeled as a c
 | `slate-pq` | Product-quantization training, encoding, and ADC lookup tables. |
 | `slate-graph` | HNSW and IVF approximate-search backends. |
 | `slate-index` | Brute-force oracle, bundle format, persistence, and update log. |
-| `slate-cli` | `slate` command-line interface for build, query, bench, insert, and delete workflows. |
+| `slate-ann-cli` | `slate` command-line interface for build, query, bench, insert, and delete workflows. |
 
 ## Build
 
@@ -55,26 +55,26 @@ The CLI reads plain-text vectors: one vector per line, whitespace-separated `f32
 Build a bundle:
 
 ```powershell
-cargo run -p slate-cli -- build vectors.txt bundle --backend hnsw --metric l2
+cargo run -p slate-ann-cli -- build vectors.txt bundle --backend hnsw --metric l2
 ```
 
 Query the bundle:
 
 ```powershell
-cargo run -p slate-cli -- query bundle query.txt --k 10
+cargo run -p slate-ann-cli -- query bundle query.txt --k 10
 ```
 
 Benchmark modeled storage cost:
 
 ```powershell
-cargo run -p slate-cli -- bench bundle queries.txt --k 10 --profile hdd --recall
+cargo run -p slate-ann-cli -- bench bundle queries.txt --k 10 --profile hdd --recall
 ```
 
 Apply buffered updates:
 
 ```powershell
-cargo run -p slate-cli -- insert bundle new-vector.txt
-cargo run -p slate-cli -- delete bundle --id 42
+cargo run -p slate-ann-cli -- insert bundle new-vector.txt
+cargo run -p slate-ann-cli -- delete bundle --id 42
 ```
 
 ## Design Notes

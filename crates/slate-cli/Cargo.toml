@@ -1,5 +1,5 @@
 [package]
-name = "slate-cli"
+name = "slate-ann-cli"
 description = "Command-line build/query/bench tool for the Slate-ANN vector search engine"
 version.workspace = true
 edition.workspace = true
