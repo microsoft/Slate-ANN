@@ -85,6 +85,10 @@ Slate-ANN separates the cost model into traversal, storage access, and distance 
 
 See `docs/storage-aware-search.md` for the longer design rationale.
 
+## Contributors
+
+Slate-ANN was created and authored by **Anirudh Ganesh**, Senior Software Engineer at Microsoft ([@TheAnig](https://github.com/TheAnig)). It was originally built for internal use and later released as open source.
+
 ## License
 
 Licensed under either of:

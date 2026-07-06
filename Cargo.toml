@@ -16,7 +16,7 @@ edition = "2021"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/microsoft/Slate-ANN"
-authors = ["Slate-ANN contributors"]
+authors = ["Anirudh Ganesh"]
 
 # Centralized dependency versions. Member crates reference these with
 # `dep = { workspace = true }` so versions stay consistent workspace-wide.
