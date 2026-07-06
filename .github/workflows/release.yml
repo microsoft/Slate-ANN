@@ -37,19 +37,112 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Verify release tag matches crate version
+      - name: Apply release version from tag
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PUBLISHED_AT: ${{ github.event.release.published_at }}
         run: |
-          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "slate-core"))')
-          tag_version=${RELEASE_TAG#v}
-          if [ "$tag_version" != "$version" ]; then
-            echo "Release tag '$RELEASE_TAG' does not match workspace crate version '$version'."
+          version=${RELEASE_TAG#v}
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag '$RELEASE_TAG' is not a valid Cargo package version."
             exit 1
           fi
 
+          python3 - "$version" "$RELEASE_PUBLISHED_AT" <<'PY'
+          import datetime as dt
+          import re
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          published_at = sys.argv[2] if len(sys.argv) > 2 else ""
+          release_date = published_at[:10] if published_at else dt.datetime.utcnow().date().isoformat()
+
+          cargo = Path("Cargo.toml")
+          text = cargo.read_text(encoding="utf-8")
+          text, count = re.subn(
+              r'(?m)^version = "[^"]+"$',
+              f'version = "{version}"',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("failed to update workspace package version")
+
+          internal_crates = [
+              "slate-core",
+              "slate-simd",
+              "slate-storage",
+              "slate-pq",
+              "slate-graph",
+              "slate-index",
+          ]
+          for crate in internal_crates:
+              pattern = rf'(?m)^({re.escape(crate)} = \{{ path = "crates/[^\"]+", version = ")[^"]+(" \}})$'
+              text, count = re.subn(
+                  pattern,
+                  lambda match: f"{match.group(1)}{version}{match.group(2)}",
+                  text,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit(f"failed to update dependency version for {crate}")
+          cargo.write_text(text, encoding="utf-8", newline="\n")
+
+          citation = Path("CITATION.cff")
+          if citation.exists():
+              cff = citation.read_text(encoding="utf-8")
+              cff, version_count = re.subn(
+                  r'(?m)^version: ".*"$',
+                  f'version: "{version}"',
+                  cff,
+                  count=1,
+              )
+              cff, date_count = re.subn(
+                  r'(?m)^date-released: ".*"$',
+                  f'date-released: "{release_date}"',
+                  cff,
+                  count=1,
+              )
+              if version_count != 1 or date_count != 1:
+                  raise SystemExit("failed to update CITATION.cff release metadata")
+              citation.write_text(cff, encoding="utf-8", newline="\n")
+          PY
+
+          cargo update --workspace
+
+          mkdir -p target
+          cargo metadata --no-deps --format-version 1 > target/release-metadata.json
+          python3 - "$version" target/release-metadata.json <<'PY'
+          import json
+          import sys
+
+          expected = sys.argv[1]
+          metadata_path = sys.argv[2]
+          package_names = {
+              "slate-core",
+              "slate-simd",
+              "slate-storage",
+              "slate-pq",
+              "slate-graph",
+              "slate-index",
+              "slate-ann-cli",
+          }
+          with open(metadata_path, encoding="utf-8-sig") as metadata:
+              data = json.load(metadata)
+          packages = {package["name"]: package["version"] for package in data["packages"]}
+          bad = [
+              f"{name}={packages.get(name, '<missing>')}"
+              for name in sorted(package_names)
+              if packages.get(name) != expected
+          ]
+          if bad:
+              raise SystemExit("release version mismatch: " + ", ".join(bad))
+          print(f"Prepared Slate-ANN workspace version {expected}")
+          PY
+
       - name: Package workspace
-        run: cargo package --workspace --locked
+        run: cargo package --workspace --locked --allow-dirty
 
       - name: Authenticate to crates.io
         id: auth
@@ -58,4 +151,4 @@ jobs:
       - name: Publish workspace
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --workspace --locked
+        run: cargo publish --workspace --locked --allow-dirty
