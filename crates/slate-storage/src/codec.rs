@@ -72,7 +72,11 @@ pub fn encode_i8(vector: &[f32], out: &mut [u8]) -> Result<()> {
     }
 
     let max_abs = vector.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-    let scale = if max_abs == 0.0 { 0.0 } else { max_abs / I8_MAX };
+    let scale = if max_abs == 0.0 {
+        0.0
+    } else {
+        max_abs / I8_MAX
+    };
 
     let (scale_bytes, code_bytes) = out.split_at_mut(core::mem::size_of::<f32>());
     scale_bytes.copy_from_slice(&scale.to_le_bytes());

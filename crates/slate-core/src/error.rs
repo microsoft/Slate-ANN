@@ -65,7 +65,10 @@ mod tests {
             expected: 768,
             got: 512,
         };
-        assert_eq!(e.to_string(), "dimension mismatch: index expects 768, got 512");
+        assert_eq!(
+            e.to_string(),
+            "dimension mismatch: index expects 768, got 512"
+        );
 
         let e = Error::NotFound(VectorId::new(9));
         assert_eq!(e.to_string(), "vector #9 not found");

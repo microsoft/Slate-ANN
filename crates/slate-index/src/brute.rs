@@ -69,7 +69,10 @@ mod tests {
     use tempfile::NamedTempFile;
 
     /// Write `vectors` to a temp store and open it via the mmap backend.
-    fn build_store(vectors: &[Vec<f32>], dims: usize) -> (NamedTempFile, VectorStore<slate_storage::MmapBackend>) {
+    fn build_store(
+        vectors: &[Vec<f32>],
+        dims: usize,
+    ) -> (NamedTempFile, VectorStore<slate_storage::MmapBackend>) {
         let tmp = NamedTempFile::new().unwrap();
         let block_size = StorageParams::default().block_size;
         let layout = BlockLayout::new(Dtype::F32, dims, block_size).unwrap();
@@ -117,11 +120,7 @@ mod tests {
 
     #[test]
     fn inner_product_ranks_by_negated_dot() {
-        let vectors = vec![
-            vec![1.0, 0.0],
-            vec![10.0, 0.0],
-            vec![0.0, 1.0],
-        ];
+        let vectors = vec![vec![1.0, 0.0], vec![10.0, 0.0], vec![0.0, 1.0]];
         let (_tmp, store) = build_store(&vectors, 2);
         let got = brute_force_search(&store, &[1.0, 0.0], Metric::InnerProduct, &cfg(1)).unwrap();
         // Largest dot (10) => smallest negated score => best.
@@ -160,7 +159,10 @@ mod tests {
         let err = brute_force_search(&store, &[1.0, 2.0], Metric::L2, &cfg(1)).unwrap_err();
         assert!(matches!(
             err,
-            Error::DimensionMismatch { expected: 3, got: 2 }
+            Error::DimensionMismatch {
+                expected: 3,
+                got: 2
+            }
         ));
     }
 }

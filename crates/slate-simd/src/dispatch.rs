@@ -14,11 +14,11 @@
 
 use std::sync::OnceLock;
 
+#[cfg(target_arch = "aarch64")]
+use crate::neon;
 use crate::scalar;
 #[cfg(target_arch = "x86_64")]
 use crate::{avx2, avx512};
-#[cfg(target_arch = "aarch64")]
-use crate::neon;
 
 /// Which implementation tier the dispatcher selected for this CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

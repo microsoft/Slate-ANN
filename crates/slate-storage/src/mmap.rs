@@ -103,9 +103,12 @@ impl MmapView {
         let end = offset
             .checked_add(len)
             .ok_or_else(|| Error::corrupt("mmap slice range overflow"))?;
-        self.mmap
-            .get(offset..end)
-            .ok_or_else(|| Error::corrupt(format!("mmap slice {offset}..{end} out of bounds (len {})", self.mmap.len())))
+        self.mmap.get(offset..end).ok_or_else(|| {
+            Error::corrupt(format!(
+                "mmap slice {offset}..{end} out of bounds (len {})",
+                self.mmap.len()
+            ))
+        })
     }
 
     /// Apply an access-pattern [`Advice`] to the entire mapping.

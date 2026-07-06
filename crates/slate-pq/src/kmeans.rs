@@ -59,7 +59,7 @@ pub fn train(
     seed: u64,
 ) -> Result<KMeansResult> {
     debug_assert!(sub_dim > 0);
-    let n = if sub_dim == 0 { 0 } else { points.len() / sub_dim };
+    let n = points.len().checked_div(sub_dim).unwrap_or(0);
 
     // Fewer points than requested centroids: each point is its own centroid.
     if n <= k {
